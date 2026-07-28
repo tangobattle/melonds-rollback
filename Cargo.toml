@@ -7,7 +7,9 @@ license = "GPL-3.0-or-later"
 description = "Rollback netplay over a link of two emulated DSes"
 
 [dependencies]
-melonds = { path = "../melonds-rs" }
+# Git rather than path: a path dependency does not travel when this
+# crate is itself consumed as a git dependency.
+melonds = { git = "https://github.com/tangobattle/melonds-rs" }
 getgud = { git = "https://github.com/tangobattle/getgud" }
 log = "0.4"
 thiserror = "1"
