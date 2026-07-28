@@ -6,6 +6,18 @@
 use melonds_rollback::{Input, Link, Snapshot};
 
 fn main() {
+    // Run on a thread with a large stack: melonDS's construction path
+    // puts sizeable temporaries on the caller's stack, and the default
+    // main-thread stack is not obviously enough for it.
+    std::thread::Builder::new()
+        .stack_size(256 << 20)
+        .spawn(run)
+        .expect("spawn")
+        .join()
+        .expect("bench thread panicked");
+}
+
+fn run() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let rom = std::fs::read(&args[0]).expect("failed to read rom");
     let save = std::fs::read(&args[1]).expect("failed to read save");

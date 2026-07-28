@@ -23,6 +23,10 @@ fn main() {
     // Walking the menus into a battle takes minutes, and the result is
     // just a link snapshot — so cache it and restore instead.
     let cache = args.get(5).map(std::path::PathBuf::from);
+    // How often the simulated peer changes its input. Real play holds a
+    // button for many frames at a time, so repeat-last prediction is
+    // usually right; a small period here is a deliberately hostile test.
+    let flip: u32 = args.get(6).map(|s| s.parse().unwrap()).unwrap_or(7);
 
     let mut link = Link::new(&rom, [Some(&save), Some(&save)], (2026, 1, 1, 0, 0, 0)).expect("cart rejected");
 
@@ -81,7 +85,7 @@ fn main() {
         // case rollback exists for.
         pending.push((
             outgoing.tick,
-            Input::keys(if (tick / 7) % 2 == 0 { melonds::keys::B } else { 0 }),
+            Input::keys(if (tick / flip) % 2 == 0 { melonds::keys::B } else { 0 }),
         ));
         if pending.len() > 3 {
             let (_, input) = pending.remove(0);

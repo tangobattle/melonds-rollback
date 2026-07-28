@@ -484,8 +484,23 @@ impl Link {
             Some(snap) => snap.consoles,
             None => [Vec::new(), Vec::new()],
         };
-        for (nds, buf) in self.consoles.iter_mut().zip(consoles.iter_mut()) {
-            nds.save_state(buf)?;
+        // The two consoles serialize independently, and at ~6 MB each
+        // this is memory-bound — so do them at the same time rather than
+        // one after the other. Nothing is shared: each call touches only
+        // its own instance and its own buffer.
+        let mut results = [None, None];
+        std::thread::scope(|s| {
+            for ((nds, buf), slot) in self
+                .consoles
+                .iter_mut()
+                .zip(consoles.iter_mut())
+                .zip(results.iter_mut())
+            {
+                s.spawn(move || *slot = Some(nds.save_state(buf)));
+            }
+        });
+        for result in results {
+            result.expect("snapshot thread did not run")?;
         }
         let st = self.air.state.lock().unwrap();
         Ok(Snapshot {
@@ -507,8 +522,19 @@ impl Link {
     /// Resume from a capture. Simulation continues from the frame *after*
     /// the one that had completed when the snapshot was taken.
     pub fn restore(&mut self, snap: &Snapshot) -> Result<(), melonds::Error> {
-        for (nds, buf) in self.consoles.iter_mut().zip(snap.consoles.iter()) {
-            nds.load_state(buf)?;
+        let mut results = [None, None];
+        std::thread::scope(|s| {
+            for ((nds, buf), slot) in self
+                .consoles
+                .iter_mut()
+                .zip(snap.consoles.iter())
+                .zip(results.iter_mut())
+            {
+                s.spawn(move || *slot = Some(nds.load_state(buf)));
+            }
+        });
+        for result in results {
+            result.expect("restore thread did not run")?;
         }
         let mut st = self.air.state.lock().unwrap();
         for i in 0..2 {
