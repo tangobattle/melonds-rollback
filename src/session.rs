@@ -79,6 +79,11 @@ impl LinkHandle {
 struct LinkWorld {
     shared: Arc<Mutex<Shared>>,
     local_player: usize,
+    /// Snapshots the engine has finished with, kept for their
+    /// allocations. A DS state is ~6 MB per console and the engine
+    /// retires one nearly every tick, so recycling turns a steady
+    /// stream of multi-megabyte allocations into buffer reuse.
+    pool: Vec<Snapshot>,
 }
 
 impl getgud::World for LinkWorld {
@@ -102,12 +107,21 @@ impl getgud::World for LinkWorld {
     }
 
     fn save(&mut self) -> Result<SnapshotAt, melonds::Error> {
+        let recycled = self.pool.pop();
         let mut shared = self.shared.lock().unwrap();
         let tick = shared.live_tick;
         Ok(SnapshotAt {
-            snap: shared.link.snapshot()?,
+            snap: shared.link.snapshot_into(recycled)?,
             tick,
         })
+    }
+
+    fn recycle(&mut self, state: SnapshotAt) {
+        // Two deep is enough to cover the settled state plus the one
+        // being replaced; more would just hold memory.
+        if self.pool.len() < 2 {
+            self.pool.push(state.snap);
+        }
     }
 
     fn load(&mut self, state: &SnapshotAt) -> Result<(), melonds::Error> {
@@ -163,6 +177,7 @@ impl Session {
                 world: LinkWorld {
                     shared: shared.clone(),
                     local_player,
+                    pool: Vec::new(),
                 },
             }),
             shared,

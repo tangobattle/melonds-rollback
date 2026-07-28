@@ -317,6 +317,94 @@ impl Snapshot {
     pub fn size(&self) -> usize {
         self.consoles.iter().map(Vec::len).sum()
     }
+
+    /// Serialize to bytes, so a primed link can be cached on disk
+    /// instead of walked through the game's menus again.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.size() + 4096);
+        let mut put_u64 = |out: &mut Vec<u8>, v: u64| out.extend_from_slice(&v.to_le_bytes());
+        let mut put_frames = |out: &mut Vec<u8>, frames: &[Frame]| {
+            put_u64(out, frames.len() as u64);
+            for frame in frames {
+                let (kind, ts, aid, data) = match frame {
+                    Frame::Reply { ts, aid, data } => (1u8, *ts, *aid, data),
+                    Frame::Other { ts, data } => (0u8, *ts, 0, data),
+                };
+                out.push(kind);
+                put_u64(out, ts);
+                out.extend_from_slice(&aid.to_le_bytes());
+                put_u64(out, data.len() as u64);
+                out.extend_from_slice(data);
+            }
+        };
+        for i in 0..2 {
+            put_u64(&mut out, self.consoles[i].len() as u64);
+            out.extend_from_slice(&self.consoles[i]);
+            put_frames(&mut out, &self.incoming[i]);
+            put_frames(&mut out, &self.replies[i]);
+            put_u64(&mut out, self.progress[i]);
+            out.push(self.attached[i] as u8);
+        }
+        out.push(self.turn as u8);
+        out
+    }
+
+    /// Inverse of [`to_bytes`](Self::to_bytes). `None` if the bytes are
+    /// truncated or malformed.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Snapshot> {
+        let mut at = 0usize;
+        let mut u64_at = |at: &mut usize| -> Option<u64> {
+            let v = u64::from_le_bytes(bytes.get(*at..*at + 8)?.try_into().ok()?);
+            *at += 8;
+            Some(v)
+        };
+        let mut consoles = [Vec::new(), Vec::new()];
+        let mut incoming = [Vec::new(), Vec::new()];
+        let mut replies = [Vec::new(), Vec::new()];
+        let mut progress = [0u64; 2];
+        let mut attached = [false; 2];
+        for i in 0..2 {
+            let len = u64_at(&mut at)? as usize;
+            consoles[i] = bytes.get(at..at + len)?.to_vec();
+            at += len;
+            for queue in 0..2 {
+                let count = u64_at(&mut at)? as usize;
+                let mut frames = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let kind = *bytes.get(at)?;
+                    at += 1;
+                    let ts = u64_at(&mut at)?;
+                    let aid = u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?);
+                    at += 2;
+                    let len = u64_at(&mut at)? as usize;
+                    let data = bytes.get(at..at + len)?.to_vec();
+                    at += len;
+                    frames.push(if kind == 1 {
+                        Frame::Reply { ts, aid, data }
+                    } else {
+                        Frame::Other { ts, data }
+                    });
+                }
+                if queue == 0 {
+                    incoming[i] = frames;
+                } else {
+                    replies[i] = frames;
+                }
+            }
+            progress[i] = u64_at(&mut at)?;
+            attached[i] = *bytes.get(at)? != 0;
+            at += 1;
+        }
+        let turn = *bytes.get(at)? as usize;
+        Some(Snapshot {
+            consoles,
+            incoming,
+            replies,
+            progress,
+            attached,
+            turn,
+        })
+    }
 }
 
 /// Two DSes wired together over emulated local wireless.
@@ -385,7 +473,17 @@ impl Link {
 
     /// Capture the whole link — both consoles and the air between them.
     pub fn snapshot(&mut self) -> Result<Snapshot, melonds::Error> {
-        let mut consoles = [Vec::new(), Vec::new()];
+        self.snapshot_into(None)
+    }
+
+    /// Capture into a retired snapshot's buffers when one is offered.
+    /// Rollback retires a snapshot nearly every tick, so reusing those
+    /// allocations keeps a session off the allocator's hot path.
+    pub fn snapshot_into(&mut self, recycled: Option<Snapshot>) -> Result<Snapshot, melonds::Error> {
+        let mut consoles = match recycled {
+            Some(snap) => snap.consoles,
+            None => [Vec::new(), Vec::new()],
+        };
         for (nds, buf) in self.consoles.iter_mut().zip(consoles.iter_mut()) {
             nds.save_state(buf)?;
         }
