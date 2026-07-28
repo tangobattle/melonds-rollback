@@ -1,0 +1,19 @@
+[package]
+name = "melonds-rollback"
+version = "0.1.0"
+edition = "2021"
+# Governed by the melonDS core it links (see melonds-rs).
+license = "GPL-3.0-or-later"
+description = "Rollback netplay over a link of two emulated DSes"
+
+[dependencies]
+melonds = { path = "../melonds-rs" }
+getgud = { git = "https://github.com/tangobattle/getgud" }
+log = "0.4"
+thiserror = "1"
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+sha2 = "0.10"
+
+[workspace]
