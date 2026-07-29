@@ -36,6 +36,23 @@ fn run() {
     }
     let tick = start.elapsed() / N as u32;
 
+    // A live session renders only the local console; re-simulation
+    // after a rollback renders nothing at all.
+    link.set_render([true, false]);
+    let start = std::time::Instant::now();
+    for _ in 0..N {
+        link.tick([Input::default(); 2]);
+    }
+    let tick_local = start.elapsed() / N as u32;
+
+    link.set_render([false, false]);
+    let start = std::time::Instant::now();
+    for _ in 0..N {
+        link.tick([Input::default(); 2]);
+    }
+    let tick_blind = start.elapsed() / N as u32;
+    link.set_render([true, true]);
+
     // Reuse one buffer set, the way the session's recycling pool does.
     let mut recycled = Some(link.snapshot().expect("snapshot"));
     let start = std::time::Instant::now();
@@ -52,11 +69,14 @@ fn run() {
     let restore = start.elapsed() / N as u32;
 
     println!("per tick:     {tick:.2?}  ({:.1} fps)", 1.0 / tick.as_secs_f64());
+    println!(
+        "  local-only render: {tick_local:.2?}   no render: {tick_blind:.2?}"
+    );
     println!("per snapshot: {snapshot:.2?}  ({} MiB)", snap.size() >> 20);
     println!("per restore:  {restore:.2?}");
     println!(
         "a session tick that saves once costs ~{:.2?} = {:.2}x realtime",
-        tick + snapshot,
-        1.0 / ((tick + snapshot).as_secs_f64() * 59.8261)
+        tick_local + snapshot,
+        1.0 / ((tick_local + snapshot).as_secs_f64() * 59.8261)
     );
 }

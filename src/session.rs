@@ -50,6 +50,13 @@ struct Shared {
     /// it was taken and `load` can skip a redundant restore.
     live_tick: u32,
     observer: Option<Box<dyn TickObserver>>,
+    /// Which consoles anybody displays — the local seat. The other
+    /// console never composits a framebuffer.
+    visible: [bool; 2],
+    /// First tick of the current advance whose output could reach the
+    /// screen. Ticks below this are rollback re-simulation: nobody will
+    /// ever see their frames, so nothing renders them.
+    render_from: u32,
 }
 
 /// A snapshot tagged with the tick it was taken at.
@@ -98,6 +105,10 @@ impl getgud::World for LinkWorld {
 
         let mut guard = self.shared.lock().unwrap();
         let shared = &mut *guard;
+        let render = shared.live_tick + 1 >= shared.render_from;
+        shared
+            .link
+            .set_render([render && shared.visible[0], render && shared.visible[1]]);
         shared.link.tick(inputs);
         shared.live_tick += 1;
         if let Some(observer) = shared.observer.as_mut() {
@@ -168,6 +179,8 @@ impl Session {
             link,
             live_tick: 0,
             observer: None,
+            visible: [local_player == 0, local_player == 1],
+            render_from: 0,
         }));
         Ok(Session {
             inner: getgud::Session::new(getgud::SessionParams {
@@ -194,6 +207,10 @@ impl Session {
     /// the present target. Returns the input to forward to the peer.
     pub fn advance(&mut self, local_input: Input) -> Result<(Outgoing, Report), melonds::Error> {
         let before = self.inner.local_frontier();
+        // Everything this advance re-simulates below the old frontier is
+        // rollback replay whose frames nobody sees; rendering resumes at
+        // the frontier so the tick the host presents is composited.
+        self.shared.lock().unwrap().render_from = before;
         let frame = self.inner.advance(local_input)?;
         let tick = frame.tick;
         Ok((

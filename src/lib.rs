@@ -8,14 +8,21 @@
 //! spoofed or short-circuited, so a link battle behaves exactly as it
 //! does on hardware.
 //!
-//! What makes rollback possible is the scheduling discipline: exactly
-//! one console executes at any moment, and every handoff between them is
-//! a function of emulated state alone (the peer produced a frame we
-//! were waiting for, the peer blocked too, or the peer finished its
-//! video frame). No decision consults the wall clock or thread timing,
-//! so a link is a pure function of its inputs — the same ROMs, saves,
-//! clock and key sequence always reach the same state, in this process
-//! or any other.
+//! The two consoles run **concurrently**, one thread each, and what
+//! keeps the pair deterministic is that frame delivery is gated on
+//! emulated wifi time alone. Every MP frame is stamped with its
+//! sender's wifi clock, and each console continually publishes a
+//! `progress` bound with the meaning "every frame I will ever send from
+//! now on is stamped strictly later than this". A receive polling at
+//! wifi time `t` delivers exactly the queued frames stamped `<= t`, and
+//! may conclude "nothing more can arrive" only once the peer's bound
+//! passes `t` (or the peer finished its video frame, or left the air).
+//! When both consoles block on each other, the one with the smaller
+//! wait target proceeds empty-handed — a rule that reads emulated state
+//! only. No decision consults the wall clock or thread timing, so a
+//! link is a pure function of its inputs — the same ROMs, saves, clock
+//! and key sequence always reach the same state, in this process or any
+//! other, however the threads interleave.
 //!
 //! [`Link::snapshot`] captures both consoles *and* the frames still in
 //! flight on the air; restoring it resumes the session exactly, which is
@@ -24,7 +31,7 @@
 pub mod session;
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 
 use melonds::{InstanceId, Nds};
 
@@ -81,10 +88,13 @@ impl Frame {
 struct Seat {
     incoming: VecDeque<Frame>,
     replies: VecDeque<Frame>,
-    /// Newest wifi timestamp this console has been observed at.
+    /// Everything this console will ever send from here on is stamped
+    /// *strictly later* than this. Advanced by its own sends and by the
+    /// wifi clock publish at the end of each emulated timer batch.
     progress: u64,
-    /// Blocked in a receive, waiting on the peer.
-    parked: bool,
+    /// Wait target and queue kind (`true` = replies) while blocked in a
+    /// receive, for the both-frozen tiebreak. `None` while running.
+    waiting: Option<(u64, bool)>,
     /// Finished its video frame; it will send nothing more until the next.
     frame_done: bool,
     /// Between `MP_Begin` and `MP_End` — i.e. on the air at all.
@@ -94,11 +104,10 @@ struct Seat {
 #[derive(Default)]
 struct AirState {
     seats: [Seat; 2],
-    /// Which console holds the run token. Exactly one executes at a time.
-    turn: usize,
 }
 
-/// The emulated airwaves plus the run token that serializes the pair.
+/// The emulated airwaves: two seats' frame queues plus the timestamp
+/// bounds that gate delivery.
 #[derive(Default)]
 struct Air {
     state: Mutex<AirState>,
@@ -108,10 +117,9 @@ struct Air {
 impl Air {
     fn send(&self, me: usize, frame: Frame) {
         let mut st = self.state.lock().unwrap();
-        let ts = frame.timestamp();
-        if ts > st.seats[me].progress {
-            st.seats[me].progress = ts;
-        }
+        // Deliberately no progress bump here: with host-clock adoption
+        // in play, a send proves nothing about *future* send stamps.
+        // The batch-end publishes carry the bound.
         let peer = 1 - me;
         match frame {
             Frame::Reply { .. } => st.seats[peer].replies.push_back(frame),
@@ -120,51 +128,87 @@ impl Air {
         self.cv.notify_all();
     }
 
-    /// Block until this console can be answered. Yields the run token to
-    /// the peer while blocked, so the peer runs until it produces what we
-    /// are waiting for, blocks itself, or finishes its frame.
-    fn wait<'a>(&'a self, me: usize, ts: u64, want_reply: bool) -> std::sync::MutexGuard<'a, AirState> {
-        let peer = 1 - me;
-        let have = |st: &AirState| {
-            if want_reply {
-                !st.seats[me].replies.is_empty()
-            } else {
-                !st.seats[me].incoming.is_empty()
-            }
-        };
-
+    /// The console's wifi timer finished processing everything at or
+    /// before `through`: any future send is strictly later. This SETS
+    /// rather than maxes: a client adopting its host's clock at
+    /// association can jump *backward*, and the bound must follow it
+    /// down or a stale-high value would let the peer conclude "nothing
+    /// more can arrive" about frames still to come.
+    fn publish(&self, me: usize, through: u64) {
         let mut st = self.state.lock().unwrap();
-        if ts > st.seats[me].progress {
-            st.seats[me].progress = ts;
-        }
-        // Handing the token to a console that cannot run would wedge the
-        // pair, so give up immediately instead.
-        if have(&st) || st.seats[peer].frame_done || !st.seats[peer].attached {
-            return st;
-        }
-
-        st.seats[me].parked = true;
-        st.turn = peer;
-        self.cv.notify_all();
-        loop {
-            let ready = have(&st)
-                || st.seats[peer].frame_done
-                || !st.seats[peer].attached
-                // Both parked: nobody can produce anything, so the
-                // token holder proceeds empty-handed.
-                || st.seats[peer].parked;
-            if ready && st.turn == me {
-                st.seats[me].parked = false;
-                return st;
-            }
-            st = self.cv.wait(st).unwrap();
+        if through != st.seats[me].progress {
+            st.seats[me].progress = through;
+            self.cv.notify_all();
         }
     }
 
-    /// Block until it is this console's turn to execute.
-    fn acquire(&self, me: usize) {
+    /// The bound the peer may trust for giving up: the seat's published
+    /// clock, capped by any frame still sitting unconsumed in its
+    /// inbound queues — consuming a frame can reset the console's clock
+    /// to that frame's timestamp (host-clock adoption at association),
+    /// after which its sends are only bounded by that timestamp.
+    fn bound(seat: &Seat) -> u64 {
+        let queued = seat
+            .incoming
+            .iter()
+            .chain(seat.replies.iter())
+            .map(Frame::timestamp)
+            .min();
+        match queued {
+            Some(ts) => seat.progress.min(ts),
+            None => seat.progress,
+        }
+    }
+
+    /// Whether a queued frame in the given queue is due at or before
+    /// `target` — i.e. whether a receive gated there has something to
+    /// take.
+    fn due(seat: &Seat, want_reply: bool, target: u64) -> bool {
+        let queue = if want_reply { &seat.replies } else { &seat.incoming };
+        queue.front().is_some_and(|f| f.timestamp() <= target)
+    }
+
+    /// Block until either something is due for this receive, or it is
+    /// *proven* nothing more can arrive at or before `target`: the
+    /// peer's progress bound passed it, the peer finished its video
+    /// frame (it sends nothing more this tick), or the peer left the
+    /// air.
+    ///
+    /// The deadlock case — both consoles blocked on each other — only
+    /// resolves once it is *terminal*: the peer is registered waiting
+    /// AND nothing in the current state can ever wake it (nothing due
+    /// at its target, and this console's own bound below it). That
+    /// configuration is stable and made of emulated state alone, so
+    /// however the threads interleave, both sides observe the same one
+    /// — and the smaller wait target proceeds empty-handed, seat 0 on
+    /// a tie. A merely *momentarily* blocked peer never triggers it:
+    /// it will wake on its own and may yet send frames at or before
+    /// our target, so concluding "nothing more" from its transient
+    /// state is what would let wall timing leak into the simulation.
+    fn gate<'a>(&'a self, me: usize, target: u64, want_reply: bool) -> MutexGuard<'a, AirState> {
+        let peer = 1 - me;
         let mut st = self.state.lock().unwrap();
-        while st.turn != me {
+        loop {
+            let peer_frozen = match st.seats[peer].waiting {
+                Some((peer_target, peer_reply)) => {
+                    !Self::due(&st.seats[peer], peer_reply, peer_target)
+                        && Self::bound(&st.seats[me]) <= peer_target
+                        && st.seats[me].attached
+                        && (target < peer_target || (target == peer_target && me == 0))
+                }
+                None => false,
+            };
+            let proceed = Self::due(&st.seats[me], want_reply, target)
+                || Self::bound(&st.seats[peer]) > target
+                || st.seats[peer].frame_done
+                || !st.seats[peer].attached
+                || peer_frozen;
+            if proceed {
+                st.seats[me].waiting = None;
+                return st;
+            }
+            st.seats[me].waiting = Some((target, want_reply));
+            self.cv.notify_all();
             st = self.cv.wait(st).unwrap();
         }
     }
@@ -233,62 +277,93 @@ impl melonds::Host for Router {
         data.len() as i32
     }
 
-    fn mp_recv_packet(&self, inst: InstanceId, data: &mut [u8], ts_out: &mut u64) -> Option<i32> {
-        // Non-blocking, and type-agnostic like LocalMP: both receive
-        // paths pop the same queue, so filtering by frame type here
-        // head-blocks everything behind the first command frame.
+    fn mp_clock(&self, inst: InstanceId, now: u64) {
+        if let Some(air) = current() {
+            air.publish(inst.0 as usize, now);
+        }
+    }
+
+    fn mp_recv_packet(&self, inst: InstanceId, data: &mut [u8], now: u64, ts_out: &mut u64) -> Option<i32> {
+        // Type-agnostic like LocalMP: both receive paths pop the same
+        // queue, so filtering by frame type here head-blocks everything
+        // behind the first command frame.
         let air = current()?;
         let me = inst.0 as usize;
-        let mut st = air.state.lock().unwrap();
-        Some(match st.seats[me].incoming.pop_front() {
-            Some(frame) => frame.deliver(data, ts_out),
-            None => 0,
+        air.publish(me, now.saturating_sub(1));
+        let mut st = air.gate(me, now, false);
+        Some(if Air::due(&st.seats[me], false, now) {
+            let frame = st.seats[me].incoming.pop_front().unwrap();
+            // Consuming this frame may reset the console's clock to its
+            // timestamp (host sync adoption), so the bound follows.
+            st.seats[me].progress = st.seats[me].progress.min(frame.timestamp());
+            frame.deliver(data, ts_out)
+        } else {
+            0
         })
     }
 
-    fn mp_recv_host_packet(&self, inst: InstanceId, data: &mut [u8], ts_out: &mut u64) -> Option<i32> {
+    fn mp_recv_host_packet(&self, inst: InstanceId, data: &mut [u8], now: u64, ts_out: &mut u64) -> Option<i32> {
         let air = current()?;
         let me = inst.0 as usize;
-        let ts = air.state.lock().unwrap().seats[me].progress;
-        let mut st = air.wait(me, ts, false);
-        Some(match st.seats[me].incoming.pop_front() {
-            Some(frame) => frame.deliver(data, ts_out),
-            // Nothing on the air right now is 0. `-1` means the host is
-            // GONE and tears the session down with a communication
-            // error, so it is reserved for a peer that really left.
-            None => {
-                if st.seats[1 - me].attached {
-                    0
-                } else {
-                    -1
-                }
-            }
+        air.publish(me, now.saturating_sub(1));
+        let mut st = air.gate(me, now, false);
+        Some(if Air::due(&st.seats[me], false, now) {
+            let frame = st.seats[me].incoming.pop_front().unwrap();
+            st.seats[me].progress = st.seats[me].progress.min(frame.timestamp());
+            frame.deliver(data, ts_out)
+        } else if st.seats[1 - me].attached || !st.seats[me].incoming.is_empty() {
+            // Nothing due on the air right now is 0. `-1` means the
+            // host is GONE and tears the session down with a
+            // communication error, so it is reserved for a peer that
+            // really left — and even then only once its parting frames
+            // have been consumed.
+            0
+        } else {
+            -1
         })
     }
 
-    fn mp_recv_replies(&self, inst: InstanceId, data: &mut [u8], ts: u64, aidmask: u16) -> u16 {
+    fn mp_recv_replies(&self, inst: InstanceId, data: &mut [u8], now: u64, ts: u64, aidmask: u16) -> u16 {
         let Some(air) = current() else { return 0 };
         let me = inst.0 as usize;
-        let mut st = air.wait(me, ts + REPLY_WINDOW_US, true);
-        let mut mask = 0;
-        while let Some(frame) = st.seats[me].replies.pop_front() {
-            if let Frame::Reply { ts, aid, data: payload } = frame {
-                let _ = ts;
-                if aid == 0 {
-                    continue;
-                }
-                // Payloads pack at (aid-1)*1024 while the returned mask
-                // uses the raw aid bit — mixing the two hands the host a
-                // zeroed slot for its first client.
-                let at = (aid as usize - 1) * 1024;
-                data[at..at + payload.len()].copy_from_slice(&payload);
-                mask |= 1 << aid;
-                if mask & aidmask == aidmask {
-                    break;
+        air.publish(me, now.saturating_sub(1));
+        let target = ts + REPLY_WINDOW_US;
+        let mut mask = 0u16;
+        loop {
+            let mut st = air.gate(me, target, true);
+            while Air::due(&st.seats[me], true, target) {
+                if let Some(Frame::Reply { aid, data: payload, .. }) = st.seats[me].replies.pop_front() {
+                    if aid == 0 {
+                        continue;
+                    }
+                    // Payloads pack at (aid-1)*1024 while the returned
+                    // mask uses the raw aid bit — mixing the two hands
+                    // the host a zeroed slot for its first client.
+                    let at = (aid as usize - 1) * 1024;
+                    data[at..at + payload.len()].copy_from_slice(&payload);
+                    mask |= 1 << aid;
+                    if mask & aidmask == aidmask {
+                        return mask;
+                    }
                 }
             }
+            // The gate proved no further reply can arrive in the window.
+            let me_seat = &st.seats[me];
+            let peer = &st.seats[1 - me];
+            let peer_frozen = match peer.waiting {
+                Some((peer_target, peer_reply)) => {
+                    !Air::due(peer, peer_reply, peer_target)
+                        && Air::bound(me_seat) <= peer_target
+                        && me_seat.attached
+                        && (target < peer_target || (target == peer_target && me == 0))
+                }
+                None => false,
+            };
+            let gave_up = Air::bound(peer) > target || peer.frame_done || !peer.attached || peer_frozen;
+            if gave_up {
+                return mask;
+            }
         }
-        mask
     }
 }
 
@@ -296,7 +371,7 @@ impl melonds::Host for Router {
 ///
 /// LocalMP also drops replies older than the command by 32 µs. That
 /// horizon assumes both consoles run concurrently in wall-clock time;
-/// a lockstepped pair's wifi clocks sit up to a video frame apart, so
+/// a frame-locked pair's wifi clocks sit up to a video frame apart, so
 /// applying it here would discard most of every round.
 const REPLY_WINDOW_US: u64 = 2000;
 
@@ -309,7 +384,6 @@ pub struct Snapshot {
     replies: [Vec<Frame>; 2],
     progress: [u64; 2],
     attached: [bool; 2],
-    turn: usize,
 }
 
 impl Snapshot {
@@ -322,8 +396,8 @@ impl Snapshot {
     /// instead of walked through the game's menus again.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.size() + 4096);
-        let mut put_u64 = |out: &mut Vec<u8>, v: u64| out.extend_from_slice(&v.to_le_bytes());
-        let mut put_frames = |out: &mut Vec<u8>, frames: &[Frame]| {
+        let put_u64 = |out: &mut Vec<u8>, v: u64| out.extend_from_slice(&v.to_le_bytes());
+        let put_frames = |out: &mut Vec<u8>, frames: &[Frame]| {
             put_u64(out, frames.len() as u64);
             for frame in frames {
                 let (kind, ts, aid, data) = match frame {
@@ -345,7 +419,9 @@ impl Snapshot {
             put_u64(&mut out, self.progress[i]);
             out.push(self.attached[i] as u8);
         }
-        out.push(self.turn as u8);
+        // The token-scheduler era serialized whose turn it was here;
+        // the byte stays so cached links keep parsing.
+        out.push(0);
         out
     }
 
@@ -353,7 +429,7 @@ impl Snapshot {
     /// truncated or malformed.
     pub fn from_bytes(bytes: &[u8]) -> Option<Snapshot> {
         let mut at = 0usize;
-        let mut u64_at = |at: &mut usize| -> Option<u64> {
+        let u64_at = |at: &mut usize| -> Option<u64> {
             let v = u64::from_le_bytes(bytes.get(*at..*at + 8)?.try_into().ok()?);
             *at += 8;
             Some(v)
@@ -395,14 +471,14 @@ impl Snapshot {
             attached[i] = *bytes.get(at)? != 0;
             at += 1;
         }
-        let turn = *bytes.get(at)? as usize;
+        // Skip the legacy turn byte.
+        let _ = *bytes.get(at)?;
         Some(Snapshot {
             consoles,
             incoming,
             replies,
             progress,
             attached,
-            turn,
         })
     }
 }
@@ -437,22 +513,19 @@ impl Link {
         Ok(Link { consoles, air })
     }
 
-    /// Advance both consoles one video frame.
+    /// Advance both consoles one video frame. The consoles run
+    /// concurrently; the air's timestamp gates keep every delivery a
+    /// function of emulated time alone.
     pub fn tick(&mut self, inputs: [Input; 2]) {
         {
             let mut st = self.air.state.lock().unwrap();
             st.seats[0].frame_done = false;
             st.seats[1].frame_done = false;
-            st.turn = 0;
         }
         let air = &self.air;
         std::thread::scope(|s| {
             for (i, nds) in self.consoles.iter_mut().enumerate() {
                 s.spawn(move || {
-                    // Console 0 opens every frame, and a console runs
-                    // only while it holds the token, so the two
-                    // interleave in one reproducible order.
-                    air.acquire(i);
                     match inputs[i].touch {
                         Some((x, y)) => nds.touch(x, y),
                         None => nds.release_screen(),
@@ -461,14 +534,21 @@ impl Link {
                     nds.run_frame();
                     let mut st = air.state.lock().unwrap();
                     st.seats[i].frame_done = true;
-                    // Hand off to the peer if it still owes a frame;
-                    // otherwise keep the token so a peer blocked on us
-                    // can see that we are done.
-                    st.turn = if st.seats[1 - i].frame_done { i } else { 1 - i };
                     air.cv.notify_all();
                 });
             }
         });
+    }
+
+    /// Toggle framebuffer production per console. A console nobody
+    /// displays — the remote seat, or any seat during rollback
+    /// re-simulation — skips its 2D compositing entirely; emulation
+    /// (including display capture into VRAM) is bit-identical either
+    /// way, only the framebuffer goes stale while off.
+    pub fn set_render(&mut self, render: [bool; 2]) {
+        for (nds, on) in self.consoles.iter_mut().zip(render) {
+            nds.set_render(on);
+        }
     }
 
     /// Capture the whole link — both consoles and the air between them.
@@ -515,7 +595,6 @@ impl Link {
             ],
             progress: [st.seats[0].progress, st.seats[1].progress],
             attached: [st.seats[0].attached, st.seats[1].attached],
-            turn: st.turn,
         })
     }
 
@@ -542,10 +621,9 @@ impl Link {
             st.seats[i].replies = snap.replies[i].iter().cloned().collect();
             st.seats[i].progress = snap.progress[i];
             st.seats[i].attached = snap.attached[i];
-            st.seats[i].parked = false;
+            st.seats[i].waiting = None;
             st.seats[i].frame_done = false;
         }
-        st.turn = snap.turn;
         self.air.cv.notify_all();
         Ok(())
     }
