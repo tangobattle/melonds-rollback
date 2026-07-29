@@ -129,6 +129,8 @@ struct AirState {
 struct Air {
     state: Mutex<AirState>,
     cv: Condvar,
+    /// Fired when a seat leaves the air — see [`Link::on_detach`].
+    on_detach: Mutex<Option<Box<dyn FnMut(usize) + Send>>>,
 }
 
 impl Air {
@@ -282,9 +284,14 @@ impl melonds::Host for SeatHost {
     }
 
     fn mp_end(&self) {
-        let mut st = self.air.state.lock().unwrap();
-        st.seats[self.seat].attached = false;
+        {
+            let mut st = self.air.state.lock().unwrap();
+            st.seats[self.seat].attached = false;
+        }
         self.air.cv.notify_all();
+        if let Some(hook) = self.air.on_detach.lock().unwrap().as_mut() {
+            hook(self.seat);
+        }
     }
 
     fn mp_send_packet(&self, data: &[u8], ts: u64) -> i32 {
@@ -801,6 +808,19 @@ impl Link {
     pub fn connected(&self) -> bool {
         let st = self.air.state.lock().unwrap();
         st.seats[0].attached && st.seats[1].attached
+    }
+
+    /// Install `hook`, fired with the seat index whenever a console
+    /// leaves the air. This is the game's own link-session exit
+    /// (melonDS's `MP_End`) reaching the shim — never a snapshot
+    /// restore, which reconciles seat attachment directly — so it
+    /// carries a trap's semantics without the interpreter a trap
+    /// costs: it fires from game code acting, and a rollback
+    /// re-simulation re-runs that act and fires it again at the same
+    /// emulated moment. Called on a console's own tick thread, so keep
+    /// it to a latch.
+    pub fn on_detach(&mut self, hook: impl FnMut(usize) + Send + 'static) {
+        *self.air.on_detach.lock().unwrap() = Some(Box::new(hook));
     }
 
     /// Frames in flight per seat: `[incoming, replies]` for seat 0 then
