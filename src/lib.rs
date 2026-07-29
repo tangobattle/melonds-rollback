@@ -101,7 +101,6 @@ impl Frame {
 /// of growing with the match.
 const AIR_QUEUE_DEPTH: usize = 256;
 
-#[derive(Default)]
 struct Seat {
     incoming: VecDeque<Frame>,
     replies: VecDeque<Frame>,
@@ -116,11 +115,43 @@ struct Seat {
     frame_done: bool,
     /// Between `MP_Begin` and `MP_End` — i.e. on the air at all.
     attached: bool,
+    /// When this radio's current attach epoch began, in its own wifi
+    /// clock — `u64::MAX` while it is off the air. Frames stamped
+    /// before this instant were transmitted before the radio came up,
+    /// and it never hears them. This is what makes delivery a function
+    /// of emulated time rather than of which thread reached its
+    /// `MP_Begin` first: the sender queues unconditionally, and the
+    /// receiver's own epoch decides.
+    attached_at: u64,
+}
+
+impl Default for Seat {
+    fn default() -> Self {
+        Seat {
+            incoming: VecDeque::new(),
+            replies: VecDeque::new(),
+            progress: 0,
+            waiting: None,
+            frame_done: false,
+            attached: false,
+            // A radio that has never been on hears nothing.
+            attached_at: u64::MAX,
+        }
+    }
 }
 
 #[derive(Default)]
 struct AirState {
     seats: [Seat; 2],
+    /// Both radios' attach state as it stood at the start of the
+    /// current tick. Decisions that ask about the *peer's* radio read
+    /// this instead of the live flag: the live flag flips mid-tick on
+    /// the peer's own thread, so consulting it would make the answer
+    /// depend on which console's thread ran first — the flavor of
+    /// nondeterminism that loses association frames under load. The
+    /// tick-boundary copy is settled for the whole tick, at the cost of
+    /// observing the peer's attach edges one tick late.
+    tick_attached: [bool; 2],
 }
 
 /// The emulated airwaves: two seats' frame queues plus the timestamp
@@ -138,14 +169,14 @@ impl Air {
         // in play, a send proves nothing about *future* send stamps.
         // The batch-end publishes carry the bound.
         let peer = 1 - me;
-        // A radio that is not on the air hears nothing. Queueing for it
-        // anyway would hold the frame until it attaches — and a seat
-        // that never attaches back never drains, so a host's beacons
-        // pile up in it for the rest of the match. Nothing pops them,
-        // and every one is cloned into every per-tick snapshot.
-        if !st.seats[peer].attached {
-            return;
-        }
+        // Queued even if the peer's radio is off right now: whether it
+        // hears this frame is its own epoch's question ([`Seat::attached_at`],
+        // applied by [`Self::prune`] and [`Self::due`]), answered in
+        // emulated time. Dropping here on the live flag made delivery
+        // depend on whether the peer's thread had reached its
+        // `MP_Begin` yet — wall-clock timing deciding which association
+        // frames exist. A seat that never attaches back never drains,
+        // which is what the depth cap below bounds.
         let queue = match frame {
             Frame::Reply { .. } => &mut st.seats[peer].replies,
             Frame::Other { .. } => &mut st.seats[peer].incoming,
@@ -188,11 +219,15 @@ impl Air {
     /// to that frame's timestamp (host-clock adoption at association),
     /// after which its sends are only bounded by that timestamp.
     fn bound(seat: &Seat) -> u64 {
+        // Frames from before the seat's attach epoch are never
+        // consumed, so they can't reset its clock and don't cap the
+        // bound.
         let queued = seat
             .incoming
             .iter()
             .chain(seat.replies.iter())
             .map(Frame::timestamp)
+            .filter(|&ts| ts >= seat.attached_at)
             .min();
         match queued {
             Some(ts) => seat.progress.min(ts),
@@ -202,10 +237,35 @@ impl Air {
 
     /// Whether a queued frame in the given queue is due at or before
     /// `target` — i.e. whether a receive gated there has something to
-    /// take.
+    /// take. Skips frames from before the seat's attach epoch: they
+    /// exist in the queue until a pop path prunes them, but the radio
+    /// never hears them.
     fn due(seat: &Seat, want_reply: bool, target: u64) -> bool {
         let queue = if want_reply { &seat.replies } else { &seat.incoming };
-        queue.front().is_some_and(|f| f.timestamp() <= target)
+        queue
+            .iter()
+            .find(|f| f.timestamp() >= seat.attached_at)
+            .is_some_and(|f| f.timestamp() <= target)
+    }
+
+    /// Drop from the queue fronts everything this radio can never
+    /// hear: frames stamped before its current attach epoch. Callers
+    /// pop from the front, so the front must be clean before any pop.
+    fn prune(seat: &mut Seat) {
+        while seat
+            .incoming
+            .front()
+            .is_some_and(|f| f.timestamp() < seat.attached_at)
+        {
+            seat.incoming.pop_front();
+        }
+        while seat
+            .replies
+            .front()
+            .is_some_and(|f| f.timestamp() < seat.attached_at)
+        {
+            seat.replies.pop_front();
+        }
     }
 
     /// Block until either something is due for this receive, or it is
@@ -229,6 +289,7 @@ impl Air {
         let peer = 1 - me;
         let mut st = self.state.lock().unwrap();
         loop {
+            Self::prune(&mut st.seats[me]);
             let peer_frozen = match st.seats[peer].waiting {
                 Some((peer_target, peer_reply)) => {
                     !Self::due(&st.seats[peer], peer_reply, peer_target)
@@ -238,10 +299,16 @@ impl Air {
                 }
                 None => false,
             };
+            // The peer-off-the-air arm reads the tick-boundary copy of
+            // the flag, not the live one: the live flag flips mid-tick
+            // on the peer's thread, and proceeding on it delivered a
+            // different frame set depending on which thread ran first.
+            // Liveness is safe either way — a detached peer still
+            // finishes its video frame, and `frame_done` opens the gate.
             let proceed = Self::due(&st.seats[me], want_reply, target)
                 || Self::bound(&st.seats[peer]) > target
                 || st.seats[peer].frame_done
-                || !st.seats[peer].attached
+                || !st.tick_attached[peer]
                 || peer_frozen;
             if proceed {
                 st.seats[me].waiting = None;
@@ -277,13 +344,23 @@ struct SeatHost {
 impl melonds::Host for SeatHost {
     fn mp_begin(&self) {
         let mut st = self.air.state.lock().unwrap();
-        st.seats[self.seat].attached = true;
+        let seat = &mut st.seats[self.seat];
+        seat.attached = true;
+        // The epoch opens at the radio's own clock. `progress` can lag
+        // the true instant by the tail of a timer batch, which only
+        // widens the epoch backward — deterministically, since the lag
+        // is the console's own emulated sequence.
+        seat.attached_at = seat.progress;
         self.air.cv.notify_all();
     }
 
     fn mp_end(&self) {
         let mut st = self.air.state.lock().unwrap();
-        st.seats[self.seat].attached = false;
+        let seat = &mut st.seats[self.seat];
+        seat.attached = false;
+        // Off the air, it hears nothing — anything queued for it (or
+        // still arriving) dies at the next prune.
+        seat.attached_at = u64::MAX;
         self.air.cv.notify_all();
     }
 
@@ -344,12 +421,15 @@ impl melonds::Host for SeatHost {
             let frame = st.seats[me].incoming.pop_front().unwrap();
             st.seats[me].progress = st.seats[me].progress.min(frame.timestamp());
             frame.deliver(data, ts_out)
-        } else if st.seats[1 - me].attached || !st.seats[me].incoming.is_empty() {
+        } else if st.tick_attached[1 - me] || !st.seats[me].incoming.is_empty() {
             // Nothing due on the air right now is 0. `-1` means the
             // host is GONE and tears the session down with a
             // communication error, so it is reserved for a peer that
             // really left — and even then only once its parting frames
-            // have been consumed.
+            // have been consumed. The tick-boundary attach copy keeps
+            // the verdict off the live flag: a host cycling its radio
+            // mid-tick is not "gone", and whether its flip was visible
+            // yet must not depend on thread timing.
             0
         } else {
             -1
@@ -363,7 +443,11 @@ impl melonds::Host for SeatHost {
         let mut mask = 0u16;
         loop {
             let mut st = self.air.gate(me, target, true);
-            while Air::due(&st.seats[me], true, target) {
+            loop {
+                Air::prune(&mut st.seats[me]);
+                if !Air::due(&st.seats[me], true, target) {
+                    break;
+                }
                 if let Some(Frame::Reply { aid, data: payload, .. }) = st.seats[me].replies.pop_front() {
                     if aid == 0 {
                         continue;
@@ -380,6 +464,7 @@ impl melonds::Host for SeatHost {
                 }
             }
             // The gate proved no further reply can arrive in the window.
+            let peer_tick_attached = st.tick_attached[1 - me];
             let me_seat = &st.seats[me];
             let peer = &st.seats[1 - me];
             let peer_frozen = match peer.waiting {
@@ -391,7 +476,8 @@ impl melonds::Host for SeatHost {
                 }
                 None => false,
             };
-            let gave_up = Air::bound(peer) > target || peer.frame_done || !peer.attached || peer_frozen;
+            // Same tick-boundary attach copy as the gate's own arm.
+            let gave_up = Air::bound(peer) > target || peer.frame_done || !peer_tick_attached || peer_frozen;
             if gave_up {
                 return mask;
             }
@@ -416,6 +502,7 @@ pub struct Snapshot {
     replies: [Vec<Frame>; 2],
     progress: [u64; 2],
     attached: [bool; 2],
+    attached_at: [u64; 2],
 }
 
 impl Snapshot {
@@ -472,6 +559,7 @@ impl Snapshot {
             put_frames(&mut out, &self.replies[i]);
             put_u64(&mut out, self.progress[i]);
             out.push(self.attached[i] as u8);
+            put_u64(&mut out, self.attached_at[i]);
         }
         // The token-scheduler era serialized whose turn it was here;
         // the byte stays so cached links keep parsing.
@@ -493,6 +581,7 @@ impl Snapshot {
         let mut replies = [Vec::new(), Vec::new()];
         let mut progress = [0u64; 2];
         let mut attached = [false; 2];
+        let mut attached_at = [0u64; 2];
         for i in 0..2 {
             let len = u64_at(&mut at)? as usize;
             consoles[i] = bytes.get(at..at + len)?.to_vec();
@@ -524,6 +613,7 @@ impl Snapshot {
             progress[i] = u64_at(&mut at)?;
             attached[i] = *bytes.get(at)? != 0;
             at += 1;
+            attached_at[i] = u64_at(&mut at)?;
         }
         // Skip the legacy turn byte.
         let _ = *bytes.get(at)?;
@@ -533,6 +623,7 @@ impl Snapshot {
             replies,
             progress,
             attached,
+            attached_at,
         })
     }
 }
@@ -619,6 +710,9 @@ impl Link {
             let mut st = self.air.state.lock().unwrap();
             st.seats[0].frame_done = false;
             st.seats[1].frame_done = false;
+            // The attach state every cross-seat decision reads this
+            // tick — settled here, at the barrier, where nothing runs.
+            st.tick_attached = [st.seats[0].attached, st.seats[1].attached];
         }
         let air = &self.air;
         std::thread::scope(|s| {
@@ -758,6 +852,7 @@ impl Link {
             ],
             progress: [st.seats[0].progress, st.seats[1].progress],
             attached: [st.seats[0].attached, st.seats[1].attached],
+            attached_at: [st.seats[0].attached_at, st.seats[1].attached_at],
         })
     }
 
@@ -784,9 +879,13 @@ impl Link {
             st.seats[i].replies = snap.replies[i].iter().cloned().collect();
             st.seats[i].progress = snap.progress[i];
             st.seats[i].attached = snap.attached[i];
+            st.seats[i].attached_at = snap.attached_at[i];
             st.seats[i].waiting = None;
             st.seats[i].frame_done = false;
         }
+        // Re-derived at the next tick's barrier anyway; set here so the
+        // state is coherent for anything that peeks between.
+        st.tick_attached = snap.attached;
         self.air.cv.notify_all();
         Ok(())
     }
