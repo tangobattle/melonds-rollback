@@ -99,9 +99,9 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "clang-sys"
-version = "1.8.1"
+version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b023947811758c97c59bf9d1c188fd619ad4718dcaa767947df1cadb14f39f4"
+checksum = "157a8ba7b480713b56f4c09fd13fc3e0a22a5dfab8097ba61cbc5feef950788a"
 dependencies = [
  "glob",
  "libc",
@@ -275,7 +275,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 [[package]]
 name = "melonds"
 version = "0.1.0"
-source = "git+https://github.com/tangobattle/melonds-rs#010809d4b07fc9779034ccfb45afed4097b6064e"
+source = "git+https://github.com/tangobattle/melonds-rs#83858e5081654f0a7f61ef88f120d8e71888a2cf"
 dependencies = [
  "melonds-sys",
  "thiserror",
@@ -295,7 +295,7 @@ dependencies = [
 [[package]]
 name = "melonds-sys"
 version = "0.1.0"
-source = "git+https://github.com/tangobattle/melonds-rs#010809d4b07fc9779034ccfb45afed4097b6064e"
+source = "git+https://github.com/tangobattle/melonds-rs#83858e5081654f0a7f61ef88f120d8e71888a2cf"
 dependencies = [
  "bindgen",
  "cc",

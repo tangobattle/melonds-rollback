@@ -31,10 +31,9 @@
 pub mod session;
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
-use melonds::{InstanceId, Nds};
+use melonds::Nds;
 
 /// One console's input for one frame.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash, Debug)]
@@ -264,98 +263,68 @@ impl Air {
     }
 }
 
-/// The process-global platform hook. melonDS resolves its callbacks at
-/// link time, so there is exactly one; it routes each console to its
-/// own link's air.
-///
-/// Several links can be live at once — a replay boots a display pair
-/// and a stats pair side by side, and a new match's link is created
-/// while an old session's still winds down — so routing must be
-/// precise, not "whatever exists": each link takes a serial, its
-/// consoles carry `(serial << 1) | seat` as their callback token, and
-/// a token routes to the air registered under its serial. Each pair
-/// has its own air, so links never hear each other; a dropped link's
-/// consoles talk into the void, and its drop leaves every other
-/// link's routing alone.
-static LINK_SERIAL: AtomicUsize = AtomicUsize::new(0);
-static LINKS: OnceLock<Mutex<Vec<(usize, Arc<Air>)>>> = OnceLock::new();
-
-fn route(inst: InstanceId) -> Option<(Arc<Air>, usize)> {
-    let guard = LINKS.get()?.lock().unwrap();
-    let serial = inst.0 >> 1;
-    guard
-        .iter()
-        .find(|(s, _)| *s == serial)
-        .map(|(_, air)| (air.clone(), inst.0 & 1))
+/// One seat's radio: the per-console [`melonds::Host`] a link hands
+/// each of its consoles at boot. It holds the link's air and its own
+/// seat index, and it lives exactly as long as its console does — so
+/// there is no routing table to keep in sync, links coexist freely
+/// (each pair on its own air), and nothing a stale session does can
+/// touch a newer link's wireless.
+struct SeatHost {
+    air: Arc<Air>,
+    seat: usize,
 }
 
-struct Router;
-
-impl melonds::Host for Router {
-    fn mp_begin(&self, inst: InstanceId) {
-        if let Some((air, me)) = route(inst) {
-            let mut st = air.state.lock().unwrap();
-            st.seats[me].attached = true;
-            air.cv.notify_all();
-        }
+impl melonds::Host for SeatHost {
+    fn mp_begin(&self) {
+        let mut st = self.air.state.lock().unwrap();
+        st.seats[self.seat].attached = true;
+        self.air.cv.notify_all();
     }
 
-    fn mp_end(&self, inst: InstanceId) {
-        if let Some((air, me)) = route(inst) {
-            let mut st = air.state.lock().unwrap();
-            st.seats[me].attached = false;
-            air.cv.notify_all();
-        }
+    fn mp_end(&self) {
+        let mut st = self.air.state.lock().unwrap();
+        st.seats[self.seat].attached = false;
+        self.air.cv.notify_all();
     }
 
-    fn mp_send_packet(&self, inst: InstanceId, data: &[u8], ts: u64) -> i32 {
-        if let Some((air, me)) = route(inst) {
-            air.send(me, Frame::Other { ts, data: data.to_vec() });
-        }
+    fn mp_send_packet(&self, data: &[u8], ts: u64) -> i32 {
+        self.air.send(self.seat, Frame::Other { ts, data: data.to_vec() });
         data.len() as i32
     }
 
-    fn mp_send_cmd(&self, inst: InstanceId, data: &[u8], ts: u64) -> i32 {
-        if let Some((air, me)) = route(inst) {
-            air.send(me, Frame::Other { ts, data: data.to_vec() });
-        }
+    fn mp_send_cmd(&self, data: &[u8], ts: u64) -> i32 {
+        self.air.send(self.seat, Frame::Other { ts, data: data.to_vec() });
         data.len() as i32
     }
 
-    fn mp_send_ack(&self, inst: InstanceId, data: &[u8], ts: u64) -> i32 {
-        if let Some((air, me)) = route(inst) {
-            air.send(me, Frame::Other { ts, data: data.to_vec() });
-        }
+    fn mp_send_ack(&self, data: &[u8], ts: u64) -> i32 {
+        self.air.send(self.seat, Frame::Other { ts, data: data.to_vec() });
         data.len() as i32
     }
 
-    fn mp_send_reply(&self, inst: InstanceId, data: &[u8], ts: u64, aid: u16) -> i32 {
-        if let Some((air, me)) = route(inst) {
-            air.send(
-                me,
-                Frame::Reply {
-                    ts,
-                    aid,
-                    data: data.to_vec(),
-                },
-            );
-        }
+    fn mp_send_reply(&self, data: &[u8], ts: u64, aid: u16) -> i32 {
+        self.air.send(
+            self.seat,
+            Frame::Reply {
+                ts,
+                aid,
+                data: data.to_vec(),
+            },
+        );
         data.len() as i32
     }
 
-    fn mp_clock(&self, inst: InstanceId, now: u64) {
-        if let Some((air, me)) = route(inst) {
-            air.publish(me, now);
-        }
+    fn mp_clock(&self, now: u64) {
+        self.air.publish(self.seat, now);
     }
 
-    fn mp_recv_packet(&self, inst: InstanceId, data: &mut [u8], now: u64, ts_out: &mut u64) -> Option<i32> {
+    fn mp_recv_packet(&self, data: &mut [u8], now: u64, ts_out: &mut u64) -> Option<i32> {
         // Type-agnostic like LocalMP: both receive paths pop the same
         // queue, so filtering by frame type here head-blocks everything
         // behind the first command frame.
-        let (air, me) = route(inst)?;
-        air.publish(me, now.saturating_sub(1));
-        let mut st = air.gate(me, now, false);
+        let me = self.seat;
+        self.air.publish(me, now.saturating_sub(1));
+        let mut st = self.air.gate(me, now, false);
         Some(if Air::due(&st.seats[me], false, now) {
             let frame = st.seats[me].incoming.pop_front().unwrap();
             // Consuming this frame may reset the console's clock to its
@@ -367,10 +336,10 @@ impl melonds::Host for Router {
         })
     }
 
-    fn mp_recv_host_packet(&self, inst: InstanceId, data: &mut [u8], now: u64, ts_out: &mut u64) -> Option<i32> {
-        let (air, me) = route(inst)?;
-        air.publish(me, now.saturating_sub(1));
-        let mut st = air.gate(me, now, false);
+    fn mp_recv_host_packet(&self, data: &mut [u8], now: u64, ts_out: &mut u64) -> Option<i32> {
+        let me = self.seat;
+        self.air.publish(me, now.saturating_sub(1));
+        let mut st = self.air.gate(me, now, false);
         Some(if Air::due(&st.seats[me], false, now) {
             let frame = st.seats[me].incoming.pop_front().unwrap();
             st.seats[me].progress = st.seats[me].progress.min(frame.timestamp());
@@ -387,13 +356,13 @@ impl melonds::Host for Router {
         })
     }
 
-    fn mp_recv_replies(&self, inst: InstanceId, data: &mut [u8], now: u64, ts: u64, aidmask: u16) -> u16 {
-        let Some((air, me)) = route(inst) else { return 0 };
-        air.publish(me, now.saturating_sub(1));
+    fn mp_recv_replies(&self, data: &mut [u8], now: u64, ts: u64, aidmask: u16) -> u16 {
+        let me = self.seat;
+        self.air.publish(me, now.saturating_sub(1));
         let target = ts + REPLY_WINDOW_US;
         let mut mask = 0u16;
         loop {
-            let mut st = air.gate(me, target, true);
+            let mut st = self.air.gate(me, target, true);
             while Air::due(&st.seats[me], true, target) {
                 if let Some(Frame::Reply { aid, data: payload, .. }) = st.seats[me].replies.pop_front() {
                     if aid == 0 {
@@ -580,7 +549,6 @@ const AUDIO_CAP_FRAMES: usize = 48_000;
 pub struct Link {
     consoles: [Nds; 2],
     air: Arc<Air>,
-    serial: usize,
     /// Each console's audio, taken out of its SPU every tick and held
     /// here instead.
     ///
@@ -617,37 +585,25 @@ impl Link {
     /// values on every peer so the link stays a pure function of its
     /// inputs.
     ///
-    /// Links coexist freely: each pair is on its own air, so a replay's
-    /// display and stats pairs (or a lingering old session) never hear
-    /// each other.
+    /// Links coexist freely: each console carries its own seat's radio,
+    /// and each pair is on its own air, so a replay's display and stats
+    /// pairs (or a lingering old session) never hear each other.
     pub fn new(rom: &[u8], saves: [Option<&[u8]>; 2], rtc: (i32, i32, i32, i32, i32, i32)) -> Result<Self, melonds::Error> {
-        // The router is installed once and forwards to whichever link is
-        // live; a second install is the expected no-op on re-entry.
-        let _ = melonds::install_host(Box::new(Router));
-
-        // The MAC-forming instance ids stay 0 and 1 — they are part of
-        // the simulation and must match on every peer — while the
-        // routing tokens carry this link's serial.
-        let serial = LINK_SERIAL.fetch_add(1, Ordering::Relaxed);
+        let air = Arc::new(Air::default());
+        // The MAC-forming instance ids are 0 and 1 — they are part of
+        // the simulation and must match on every peer.
         let mut consoles = [
-            Nds::new(rom, saves[0], 0, serial << 1)?,
-            Nds::new(rom, saves[1], 1, (serial << 1) | 1)?,
+            Nds::new(rom, saves[0], 0, Box::new(SeatHost { air: air.clone(), seat: 0 }))?,
+            Nds::new(rom, saves[1], 1, Box::new(SeatHost { air: air.clone(), seat: 1 }))?,
         ];
         for nds in &mut consoles {
             nds.set_rtc(rtc.0, rtc.1, rtc.2, rtc.3, rtc.4, rtc.5);
             nds.boot();
         }
 
-        let air = Arc::new(Air::default());
-        LINKS
-            .get_or_init(|| Mutex::new(Vec::new()))
-            .lock()
-            .unwrap()
-            .push((serial, air.clone()));
         Ok(Link {
             consoles,
             air,
-            serial,
             audio: [Vec::new(), Vec::new()],
             audio_produced: [0; 2],
             audio_resim_drain: [0; 2],
@@ -917,13 +873,12 @@ impl Solo {
     /// Boot one console. `rtc` pins the cart clock exactly as a link's
     /// boot does — a solo ride just has nobody to agree with.
     pub fn new(rom: &[u8], save: Option<&[u8]>, rtc: (i32, i32, i32, i32, i32, i32)) -> Result<Self, melonds::Error> {
-        let _ = melonds::install_host(Box::new(Router));
-        // A serial of its own, so this console's wireless — should the
-        // game ever touch it — talks into the void rather than into
-        // whatever pair is currently live. Never registered in LINKS:
-        // a solo boot must not cut a live pair off the air.
-        let serial = LINK_SERIAL.fetch_add(1, Ordering::Relaxed);
-        let mut console = Nds::new(rom, save, 0, serial << 1)?;
+        // A radio with no air: should the game ever touch its wireless,
+        // sends vanish and receives report not-connected — the
+        // [`melonds::Host`] defaults.
+        struct Offline;
+        impl melonds::Host for Offline {}
+        let mut console = Nds::new(rom, save, 0, Box::new(Offline))?;
         console.set_rtc(rtc.0, rtc.1, rtc.2, rtc.3, rtc.4, rtc.5);
         console.boot();
         Ok(Solo {
@@ -953,16 +908,6 @@ impl Solo {
         Side {
             console: &mut self.console,
             audio: &mut self.audio,
-        }
-    }
-}
-
-impl Drop for Link {
-    fn drop(&mut self) {
-        // Unregister exactly this link's routing entry; every other
-        // live link keeps its air.
-        if let Some(links) = LINKS.get() {
-            links.lock().unwrap().retain(|(serial, _)| *serial != self.serial);
         }
     }
 }
