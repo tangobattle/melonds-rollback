@@ -31,6 +31,7 @@
 pub mod session;
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 
 use melonds::{InstanceId, Nds};
@@ -188,6 +189,7 @@ impl Air {
     fn gate<'a>(&'a self, me: usize, target: u64, want_reply: bool) -> MutexGuard<'a, AirState> {
         let peer = 1 - me;
         let mut st = self.state.lock().unwrap();
+        let mut stalled = false;
         loop {
             let peer_frozen = match st.seats[peer].waiting {
                 Some((peer_target, peer_reply)) => {
@@ -209,7 +211,35 @@ impl Air {
             }
             st.seats[me].waiting = Some((target, want_reply));
             self.cv.notify_all();
-            st = self.cv.wait(st).unwrap();
+            let (guard, timeout) = self
+                .cv
+                .wait_timeout(st, std::time::Duration::from_secs(2))
+                .unwrap();
+            st = guard;
+            if timeout.timed_out() && !stalled {
+                // A gate should only ever wait for the peer's next
+                // wifi batch or frame — wall-milliseconds. Multiple
+                // seconds means the pair is wedged; dump everything a
+                // liveness postmortem needs and keep waiting.
+                stalled = true;
+                let dump = |seat: &Seat| {
+                    format!(
+                        "progress={} bound={} waiting={:?} attached={} frame_done={} incoming={} replies={}",
+                        seat.progress,
+                        Self::bound(seat),
+                        seat.waiting,
+                        seat.attached,
+                        seat.frame_done,
+                        seat.incoming.len(),
+                        seat.replies.len(),
+                    )
+                };
+                log::warn!(
+                    "air gate stalled >2s: seat {me} target={target} want_reply={want_reply}; me: {}; peer: {}",
+                    dump(&st.seats[me]),
+                    dump(&st.seats[peer]),
+                );
+            }
         }
     }
 }
@@ -217,56 +247,69 @@ impl Air {
 /// The process-global platform hook. melonDS resolves its callbacks at
 /// link time, so there is exactly one; it routes to whichever [`Link`]
 /// is currently live.
-static CURRENT: OnceLock<Mutex<Option<Arc<Air>>>> = OnceLock::new();
+///
+/// Links can overlap in time — a new match's link is created while an
+/// old session's still winds down — so routing must be precise, not
+/// "whatever exists": each link takes a serial, its consoles carry
+/// `(serial << 1) | seat` as their callback token, and only tokens of
+/// the current serial route. A stale link's consoles talk into the
+/// void instead of into the new link's air, and its drop leaves the
+/// new link's routing alone.
+static LINK_SERIAL: AtomicUsize = AtomicUsize::new(0);
+static CURRENT: OnceLock<Mutex<Option<(usize, Arc<Air>)>>> = OnceLock::new();
 
-fn current() -> Option<Arc<Air>> {
-    CURRENT.get()?.lock().unwrap().clone()
+fn route(inst: InstanceId) -> Option<(Arc<Air>, usize)> {
+    let guard = CURRENT.get()?.lock().unwrap();
+    match &*guard {
+        Some((serial, air)) if *serial == inst.0 >> 1 => Some((air.clone(), inst.0 & 1)),
+        _ => None,
+    }
 }
 
 struct Router;
 
 impl melonds::Host for Router {
     fn mp_begin(&self, inst: InstanceId) {
-        if let Some(air) = current() {
+        if let Some((air, me)) = route(inst) {
             let mut st = air.state.lock().unwrap();
-            st.seats[inst.0 as usize].attached = true;
+            st.seats[me].attached = true;
             air.cv.notify_all();
         }
     }
 
     fn mp_end(&self, inst: InstanceId) {
-        if let Some(air) = current() {
+        if let Some((air, me)) = route(inst) {
             let mut st = air.state.lock().unwrap();
-            st.seats[inst.0 as usize].attached = false;
+            st.seats[me].attached = false;
             air.cv.notify_all();
         }
     }
 
     fn mp_send_packet(&self, inst: InstanceId, data: &[u8], ts: u64) -> i32 {
-        if let Some(air) = current() {
-            air.send(inst.0 as usize, Frame::Other { ts, data: data.to_vec() });
+        if let Some((air, me)) = route(inst) {
+            air.send(me, Frame::Other { ts, data: data.to_vec() });
         }
         data.len() as i32
     }
 
     fn mp_send_cmd(&self, inst: InstanceId, data: &[u8], ts: u64) -> i32 {
-        if let Some(air) = current() {
-            air.send(inst.0 as usize, Frame::Other { ts, data: data.to_vec() });
+        if let Some((air, me)) = route(inst) {
+            air.send(me, Frame::Other { ts, data: data.to_vec() });
         }
         data.len() as i32
     }
 
     fn mp_send_ack(&self, inst: InstanceId, data: &[u8], ts: u64) -> i32 {
-        if let Some(air) = current() {
-            air.send(inst.0 as usize, Frame::Other { ts, data: data.to_vec() });
+        if let Some((air, me)) = route(inst) {
+            air.send(me, Frame::Other { ts, data: data.to_vec() });
         }
         data.len() as i32
     }
 
     fn mp_send_reply(&self, inst: InstanceId, data: &[u8], ts: u64, aid: u16) -> i32 {
-        if let Some(air) = current() {
+        if let Some((air, me)) = route(inst) {
             air.send(
-                inst.0 as usize,
+                me,
                 Frame::Reply {
                     ts,
                     aid,
@@ -278,8 +321,8 @@ impl melonds::Host for Router {
     }
 
     fn mp_clock(&self, inst: InstanceId, now: u64) {
-        if let Some(air) = current() {
-            air.publish(inst.0 as usize, now);
+        if let Some((air, me)) = route(inst) {
+            air.publish(me, now);
         }
     }
 
@@ -287,8 +330,7 @@ impl melonds::Host for Router {
         // Type-agnostic like LocalMP: both receive paths pop the same
         // queue, so filtering by frame type here head-blocks everything
         // behind the first command frame.
-        let air = current()?;
-        let me = inst.0 as usize;
+        let (air, me) = route(inst)?;
         air.publish(me, now.saturating_sub(1));
         let mut st = air.gate(me, now, false);
         Some(if Air::due(&st.seats[me], false, now) {
@@ -303,8 +345,7 @@ impl melonds::Host for Router {
     }
 
     fn mp_recv_host_packet(&self, inst: InstanceId, data: &mut [u8], now: u64, ts_out: &mut u64) -> Option<i32> {
-        let air = current()?;
-        let me = inst.0 as usize;
+        let (air, me) = route(inst)?;
         air.publish(me, now.saturating_sub(1));
         let mut st = air.gate(me, now, false);
         Some(if Air::due(&st.seats[me], false, now) {
@@ -324,8 +365,7 @@ impl melonds::Host for Router {
     }
 
     fn mp_recv_replies(&self, inst: InstanceId, data: &mut [u8], now: u64, ts: u64, aidmask: u16) -> u16 {
-        let Some(air) = current() else { return 0 };
-        let me = inst.0 as usize;
+        let Some((air, me)) = route(inst) else { return 0 };
         air.publish(me, now.saturating_sub(1));
         let target = ts + REPLY_WINDOW_US;
         let mut mask = 0u16;
@@ -487,6 +527,7 @@ impl Snapshot {
 pub struct Link {
     consoles: [Nds; 2],
     air: Arc<Air>,
+    serial: usize,
 }
 
 impl Link {
@@ -502,15 +543,22 @@ impl Link {
         // live; a second install is the expected no-op on re-entry.
         let _ = melonds::install_host(Box::new(Router));
 
-        let mut consoles = [Nds::new(rom, saves[0], 0)?, Nds::new(rom, saves[1], 1)?];
+        // The MAC-forming instance ids stay 0 and 1 — they are part of
+        // the simulation and must match on every peer — while the
+        // routing tokens carry this link's serial.
+        let serial = LINK_SERIAL.fetch_add(1, Ordering::Relaxed);
+        let mut consoles = [
+            Nds::new(rom, saves[0], 0, serial << 1)?,
+            Nds::new(rom, saves[1], 1, (serial << 1) | 1)?,
+        ];
         for nds in &mut consoles {
             nds.set_rtc(rtc.0, rtc.1, rtc.2, rtc.3, rtc.4, rtc.5);
             nds.boot();
         }
 
         let air = Arc::new(Air::default());
-        *CURRENT.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(air.clone());
-        Ok(Link { consoles, air })
+        *CURRENT.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some((serial, air.clone()));
+        Ok(Link { consoles, air, serial })
     }
 
     /// Advance both consoles one video frame. The consoles run
@@ -643,8 +691,16 @@ impl Link {
 
 impl Drop for Link {
     fn drop(&mut self) {
+        // Only unhook if the routing still points at THIS link: a
+        // newer link may have taken over, and clearing its routing
+        // would cut its consoles off the air mid-flight — which is
+        // exactly what a stale session dropping after a new match
+        // boots used to do.
         if let Some(slot) = CURRENT.get() {
-            *slot.lock().unwrap() = None;
+            let mut guard = slot.lock().unwrap();
+            if matches!(&*guard, Some((serial, _)) if *serial == self.serial) {
+                *guard = None;
+            }
         }
     }
 }
