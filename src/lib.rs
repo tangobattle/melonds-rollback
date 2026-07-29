@@ -75,6 +75,12 @@ impl Frame {
         }
     }
 
+    fn payload_len(&self) -> usize {
+        match self {
+            Frame::Reply { data, .. } | Frame::Other { data, .. } => data.len(),
+        }
+    }
+
     fn deliver(self, out: &mut [u8], ts_out: &mut u64) -> i32 {
         let (ts, data) = match self {
             Frame::Reply { ts, data, .. } | Frame::Other { ts, data } => (ts, data),
@@ -84,6 +90,17 @@ impl Frame {
         data.len() as i32
     }
 }
+
+/// Frames one seat's RX queue holds before the oldest starts falling off
+/// the front.
+///
+/// A frame-locked pair has single digits in flight — a command round and
+/// its reply, plus the host's beacons — so this is two orders of
+/// magnitude of headroom above anything a healthy link produces. It is a
+/// backstop against a queue that has stopped draining, not a working
+/// depth: at this size the per-tick snapshot clone stays bounded instead
+/// of growing with the match.
+const AIR_QUEUE_DEPTH: usize = 256;
 
 #[derive(Default)]
 struct Seat {
@@ -122,9 +139,32 @@ impl Air {
         // in play, a send proves nothing about *future* send stamps.
         // The batch-end publishes carry the bound.
         let peer = 1 - me;
-        match frame {
-            Frame::Reply { .. } => st.seats[peer].replies.push_back(frame),
-            Frame::Other { .. } => st.seats[peer].incoming.push_back(frame),
+        // A radio that is not on the air hears nothing. Queueing for it
+        // anyway would hold the frame until it attaches — and a seat
+        // that never attaches back never drains, so a host's beacons
+        // pile up in it for the rest of the match. Nothing pops them,
+        // and every one is cloned into every per-tick snapshot.
+        if !st.seats[peer].attached {
+            return;
+        }
+        let queue = match frame {
+            Frame::Reply { .. } => &mut st.seats[peer].replies,
+            Frame::Other { .. } => &mut st.seats[peer].incoming,
+        };
+        queue.push_back(frame);
+        // An RX queue is finite hardware: past its depth the oldest
+        // frame is gone, not held. Without this a queue whose head has
+        // stopped being due — a receiver whose clock adopted its host's
+        // and jumped back behind a stamp it already holds — blocks at
+        // the front while everything behind it accumulates unboundedly.
+        // Dropping from the front is both what the hardware does and
+        // what unblocks it.
+        //
+        // Deterministic, so it stays simulation: the depth is a
+        // function of emulated state alone, both peers simulate both
+        // consoles, and a snapshot carries the queues as they stand.
+        while queue.len() > AIR_QUEUE_DEPTH {
+            queue.pop_front();
         }
         self.cv.notify_all();
     }
@@ -408,8 +448,30 @@ pub struct Snapshot {
 
 impl Snapshot {
     /// Total bytes held, for callers budgeting a rollback buffer.
+    ///
+    /// The air counts. Its frames are cloned into every snapshot the
+    /// same as console state is, so a queue that has stopped draining
+    /// shows up here as a rollback buffer that grows with the match —
+    /// which is exactly what a caller watching this number wants to see.
     pub fn size(&self) -> usize {
-        self.consoles.iter().map(Vec::len).sum()
+        let frames = |queues: &[Vec<Frame>; 2]| -> usize {
+            queues
+                .iter()
+                .flatten()
+                .map(|f| std::mem::size_of::<Frame>() + f.payload_len())
+                .sum()
+        };
+        self.consoles.iter().map(Vec::len).sum::<usize>() + frames(&self.incoming) + frames(&self.replies)
+    }
+
+    /// Frames in flight per seat: `[incoming, replies]` for seat 0 then
+    /// seat 1. A healthy link sits in single digits; a number that
+    /// climbs with the match is a queue nothing is draining.
+    pub fn air_depth(&self) -> [[usize; 2]; 2] {
+        [
+            [self.incoming[0].len(), self.replies[0].len()],
+            [self.incoming[1].len(), self.replies[1].len()],
+        ]
     }
 
     /// Serialize to bytes, so a primed link can be cached on disk
@@ -783,6 +845,17 @@ impl Link {
         let st = self.air.state.lock().unwrap();
         st.seats[0].attached && st.seats[1].attached
     }
+
+    /// Frames in flight per seat: `[incoming, replies]` for seat 0 then
+    /// seat 1. See [`Snapshot::air_depth`] — this is the live reading of
+    /// the same thing, for a host that wants it without snapshotting.
+    pub fn air_depth(&self) -> [[usize; 2]; 2] {
+        let st = self.air.state.lock().unwrap();
+        [
+            [st.seats[0].incoming.len(), st.seats[0].replies.len()],
+            [st.seats[1].incoming.len(), st.seats[1].replies.len()],
+        ]
+    }
 }
 
 impl Drop for Link {
@@ -798,5 +871,60 @@ impl Drop for Link {
                 *guard = None;
             }
         }
+    }
+}
+
+/// The air's retention rules, which nothing else can check: reaching
+/// them through a live pair needs both consoles walked into a netbattle,
+/// and what they guard against is a queue that quietly never empties.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(ts: u64) -> Frame {
+        Frame::Other { ts, data: vec![0; 32] }
+    }
+
+    /// Wifi off is a radio that is not there to hear anything —
+    /// `attached` tracks the console's wifi power exactly (melonDS calls
+    /// `MP_Begin`/`MP_End` from `Wifi::UpdatePowerOn`).
+    ///
+    /// Holding frames for it instead is what let a console that left its
+    /// comm screen keep collecting the other's beacons for the rest of
+    /// the match. Nothing ever popped them, and every one was cloned
+    /// into every per-tick snapshot, so the tick cost climbed until the
+    /// pair stopped producing frames.
+    #[test]
+    fn a_seat_whose_wifi_is_off_receives_nothing() {
+        let air = Air::default();
+
+        air.send(0, frame(1));
+        assert_eq!(air.state.lock().unwrap().seats[1].incoming.len(), 0);
+
+        air.state.lock().unwrap().seats[1].attached = true;
+        air.send(0, frame(2));
+        assert_eq!(air.state.lock().unwrap().seats[1].incoming.len(), 1);
+    }
+
+    /// An RX queue is finite hardware. A receiver that stops draining —
+    /// its clock adopted its host's and jumped back behind a stamp it
+    /// already holds, so its head is never due — loses the oldest frames
+    /// rather than accumulating behind the stuck one.
+    #[test]
+    fn an_undrained_queue_stops_at_the_rx_depth() {
+        let air = Air::default();
+        air.state.lock().unwrap().seats[1].attached = true;
+
+        let sent = AIR_QUEUE_DEPTH as u64 * 3;
+        for ts in 0..sent {
+            air.send(0, frame(ts));
+        }
+
+        let st = air.state.lock().unwrap();
+        let queue = &st.seats[1].incoming;
+        assert_eq!(queue.len(), AIR_QUEUE_DEPTH);
+        // The front is what falls off, so what survives is the newest.
+        assert_eq!(queue.front().unwrap().timestamp(), sent - AIR_QUEUE_DEPTH as u64);
+        assert_eq!(queue.back().unwrap().timestamp(), sent - 1);
     }
 }
