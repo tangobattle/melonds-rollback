@@ -189,7 +189,6 @@ impl Air {
     fn gate<'a>(&'a self, me: usize, target: u64, want_reply: bool) -> MutexGuard<'a, AirState> {
         let peer = 1 - me;
         let mut st = self.state.lock().unwrap();
-        let mut stalled = false;
         loop {
             let peer_frozen = match st.seats[peer].waiting {
                 Some((peer_target, peer_reply)) => {
@@ -211,35 +210,16 @@ impl Air {
             }
             st.seats[me].waiting = Some((target, want_reply));
             self.cv.notify_all();
-            let (guard, timeout) = self
+            // Timed rather than plain: every state change that could
+            // free this gate notifies under the same mutex, so a wake
+            // can't be missed by construction — but a future path that
+            // forgets to notify would hang the pair outright instead of
+            // costing it a re-check.
+            st = self
                 .cv
                 .wait_timeout(st, std::time::Duration::from_secs(2))
-                .unwrap();
-            st = guard;
-            if timeout.timed_out() && !stalled {
-                // A gate should only ever wait for the peer's next
-                // wifi batch or frame — wall-milliseconds. Multiple
-                // seconds means the pair is wedged; dump everything a
-                // liveness postmortem needs and keep waiting.
-                stalled = true;
-                let dump = |seat: &Seat| {
-                    format!(
-                        "progress={} bound={} waiting={:?} attached={} frame_done={} incoming={} replies={}",
-                        seat.progress,
-                        Self::bound(seat),
-                        seat.waiting,
-                        seat.attached,
-                        seat.frame_done,
-                        seat.incoming.len(),
-                        seat.replies.len(),
-                    )
-                };
-                log::warn!(
-                    "air gate stalled >2s: seat {me} target={target} want_reply={want_reply}; me: {}; peer: {}",
-                    dump(&st.seats[me]),
-                    dump(&st.seats[peer]),
-                );
-            }
+                .unwrap()
+                .0;
         }
     }
 }
@@ -273,7 +253,6 @@ impl melonds::Host for Router {
         if let Some((air, me)) = route(inst) {
             let mut st = air.state.lock().unwrap();
             st.seats[me].attached = true;
-            log::info!("air: seat {me} joined (peer attached={})", st.seats[1 - me].attached);
             air.cv.notify_all();
         }
     }
@@ -282,10 +261,6 @@ impl melonds::Host for Router {
         if let Some((air, me)) = route(inst) {
             let mut st = air.state.lock().unwrap();
             st.seats[me].attached = false;
-            // A console leaving the air mid-session is the emulated
-            // side of a communication error — worth a breadcrumb in a
-            // host's log even when it is a legitimate teardown.
-            log::info!("air: seat {me} left (peer attached={})", st.seats[1 - me].attached);
             air.cv.notify_all();
         }
     }

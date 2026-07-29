@@ -11,7 +11,6 @@ description = "Rollback netplay over a link of two emulated DSes"
 # crate is itself consumed as a git dependency.
 melonds = { git = "https://github.com/tangobattle/melonds-rs" }
 getgud = { git = "https://github.com/tangobattle/getgud" }
-log = "0.4"
 thiserror = "1"
 
 [dev-dependencies]

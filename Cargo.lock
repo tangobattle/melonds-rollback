@@ -287,7 +287,6 @@ version = "0.1.0"
 dependencies = [
  "getgud",
  "image",
- "log",
  "melonds",
  "sha2",
  "thiserror",
