@@ -107,45 +107,6 @@ struct AirState {
     seats: [Seat; 2],
 }
 
-/// Desync postmortem log: MDS_AIR_LOG=<path> records every
-/// state-relevant air event (sends, deliveries, attach transitions,
-/// reply outcomes). Two runs of the same link must produce
-/// byte-identical per-seat streams; diffing them pinpoints the first
-/// divergent emulated event. Free when the variable is unset.
-pub mod airlog {
-    use std::io::Write;
-    use std::sync::{Mutex, OnceLock};
-    // Unbuffered on purpose: process exit never drops statics, so a
-    // buffered tail would truncate the log mid-line — and a diff of two
-    // runs would report the torn ends as divergence.
-    static FILE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
-
-    pub fn enabled() -> bool {
-        FILE.get_or_init(init).is_some()
-    }
-
-    fn init() -> Option<Mutex<std::fs::File>> {
-        std::env::var("MDS_AIR_LOG")
-            .ok()
-            .and_then(|p| std::fs::File::create(p).ok())
-            .map(Mutex::new)
-    }
-
-    pub fn log(args: std::fmt::Arguments) {
-        if let Some(f) = FILE.get_or_init(init) {
-            let _ = writeln!(f.lock().unwrap(), "{args}");
-        }
-    }
-}
-
-macro_rules! airlog {
-    ($($t:tt)*) => {
-        if crate::airlog::enabled() {
-            crate::airlog::log(format_args!($($t)*));
-        }
-    };
-}
-
 /// The emulated airwaves: two seats' frame queues plus the timestamp
 /// bounds that gate delivery.
 #[derive(Default)]
@@ -156,14 +117,6 @@ struct Air {
 
 impl Air {
     fn send(&self, me: usize, frame: Frame) {
-        airlog!(
-            "SEND {me} ts={} len={} reply={}",
-            frame.timestamp(),
-            match &frame {
-                Frame::Reply { data, .. } | Frame::Other { data, .. } => data.len(),
-            },
-            matches!(frame, Frame::Reply { .. })
-        );
         let mut st = self.state.lock().unwrap();
         // Deliberately no progress bump here: with host-clock adoption
         // in play, a send proves nothing about *future* send stamps.
@@ -320,7 +273,6 @@ impl melonds::Host for Router {
         if let Some((air, me)) = route(inst) {
             let mut st = air.state.lock().unwrap();
             st.seats[me].attached = true;
-            airlog!("BEGIN {me}");
             log::info!("air: seat {me} joined (peer attached={})", st.seats[1 - me].attached);
             air.cv.notify_all();
         }
@@ -330,7 +282,6 @@ impl melonds::Host for Router {
         if let Some((air, me)) = route(inst) {
             let mut st = air.state.lock().unwrap();
             st.seats[me].attached = false;
-            airlog!("END {me}");
             // A console leaving the air mid-session is the emulated
             // side of a communication error — worth a breadcrumb in a
             // host's log even when it is a legitimate teardown.
@@ -392,7 +343,6 @@ impl melonds::Host for Router {
             // Consuming this frame may reset the console's clock to its
             // timestamp (host sync adoption), so the bound follows.
             st.seats[me].progress = st.seats[me].progress.min(frame.timestamp());
-            airlog!("DELIVP {me} now={now} ts={}", frame.timestamp());
             frame.deliver(data, ts_out)
         } else {
             0
@@ -406,7 +356,6 @@ impl melonds::Host for Router {
         Some(if Air::due(&st.seats[me], false, now) {
             let frame = st.seats[me].incoming.pop_front().unwrap();
             st.seats[me].progress = st.seats[me].progress.min(frame.timestamp());
-            airlog!("DELIVH {me} now={now} ts={}", frame.timestamp());
             frame.deliver(data, ts_out)
         } else if st.seats[1 - me].attached || !st.seats[me].incoming.is_empty() {
             // Nothing due on the air right now is 0. `-1` means the
@@ -416,7 +365,6 @@ impl melonds::Host for Router {
             // have been consumed.
             0
         } else {
-            airlog!("HOSTGONE {me} now={now}");
             -1
         })
     }
@@ -440,7 +388,6 @@ impl melonds::Host for Router {
                     data[at..at + payload.len()].copy_from_slice(&payload);
                     mask |= 1 << aid;
                     if mask & aidmask == aidmask {
-                        airlog!("REPL {me} now={now} ts={ts} mask={mask}");
                         return mask;
                     }
                 }
@@ -459,7 +406,6 @@ impl melonds::Host for Router {
             };
             let gave_up = Air::bound(peer) > target || peer.frame_done || !peer.attached || peer_frozen;
             if gave_up {
-                airlog!("REPLGIVE {me} now={now} ts={ts} mask={mask}");
                 return mask;
             }
         }
