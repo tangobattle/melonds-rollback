@@ -14,6 +14,9 @@
 //! runs `len` frames and digests both consoles' RAM, restores, replays
 //! the same span, and compares — a live wireless session must come back
 //! bit-identical.
+//!
+//! `--rtc <y-m-d-h:m:s>` pins the cart clock; a real match negotiates
+//! wall time, so the walk must connect on every timeline, not just one.
 
 use melonds_rollback::Link;
 use sha2::Digest;
@@ -59,6 +62,16 @@ fn main() {
             None => (spec.parse().unwrap(), 120usize),
         }
     });
+    let rtc = args
+        .iter()
+        .position(|a| a == "--rtc")
+        .map(|i| {
+            let spec = args[i + 1].clone();
+            args.drain(i..=i + 1);
+            let parts: Vec<i32> = spec.split(['-', ':']).map(|p| p.parse().unwrap()).collect();
+            (parts[0], parts[1], parts[2], parts[3], parts[4], parts[5])
+        })
+        .unwrap_or((2026, 1, 1, 0, 0, 0));
 
     let rom = std::fs::read(&args[0]).expect("failed to read rom");
     let save = std::fs::read(&args[1]).expect("failed to read save");
@@ -66,7 +79,7 @@ fn main() {
     let outdir = std::path::PathBuf::from(&args[4]);
     std::fs::create_dir_all(&outdir).unwrap();
 
-    let mut link = Link::new(&rom, [Some(&save), Some(&save)], (2026, 1, 1, 0, 0, 0)).expect("cart rejected");
+    let mut link = Link::new(&rom, [Some(&save), Some(&save)], rtc).expect("cart rejected");
 
     let total = scripts[0].0.len().max(scripts[1].0.len());
     let start = std::time::Instant::now();

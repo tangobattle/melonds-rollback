@@ -273,6 +273,7 @@ impl melonds::Host for Router {
         if let Some((air, me)) = route(inst) {
             let mut st = air.state.lock().unwrap();
             st.seats[me].attached = true;
+            log::info!("air: seat {me} joined (peer attached={})", st.seats[1 - me].attached);
             air.cv.notify_all();
         }
     }
@@ -281,6 +282,10 @@ impl melonds::Host for Router {
         if let Some((air, me)) = route(inst) {
             let mut st = air.state.lock().unwrap();
             st.seats[me].attached = false;
+            // A console leaving the air mid-session is the emulated
+            // side of a communication error — worth a breadcrumb in a
+            // host's log even when it is a legitimate teardown.
+            log::info!("air: seat {me} left (peer attached={})", st.seats[1 - me].attached);
             air.cv.notify_all();
         }
     }
