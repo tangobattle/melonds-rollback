@@ -207,10 +207,14 @@ impl Session {
     /// the present target. Returns the input to forward to the peer.
     pub fn advance(&mut self, local_input: Input) -> Result<(Outgoing, Report), melonds::Error> {
         let before = self.inner.local_frontier();
-        // Everything this advance re-simulates below the old frontier is
-        // rollback replay whose frames nobody sees; rendering resumes at
-        // the frontier so the tick the host presents is composited.
-        self.shared.lock().unwrap().render_from = before;
+        // The simulation only ever reaches the present target — the
+        // frontier is the *input* frontier, `present_delay` ticks ahead
+        // of it. Everything below the target is rollback replay whose
+        // frames nobody sees; rendering resumes at the target so the
+        // frame the host presents is composited. (Gating at the frontier
+        // itself renders nothing at all: no simulated tick ever clears
+        // that bar.)
+        self.shared.lock().unwrap().render_from = before.saturating_sub(self.inner.present_delay());
         let frame = self.inner.advance(local_input)?;
         let tick = frame.tick;
         Ok((
