@@ -680,12 +680,7 @@ impl Link {
     fn collect_audio(&mut self) {
         for i in 0..2 {
             let before = self.audio[i].len();
-            let queued = self.consoles[i].audio_queued();
-            if queued > 0 {
-                self.audio_scratch.resize(queued * 2, 0);
-                let got = self.consoles[i].read_audio(&mut self.audio_scratch);
-                self.audio[i].extend_from_slice(&self.audio_scratch[..got * 2]);
-            }
+            pump_spu(&mut self.consoles[i], &mut self.audio[i], &mut self.audio_scratch);
             let mut delta = ((self.audio[i].len() - before) / 2) as u64;
             if self.audio_resim_drain[i] > 0 && delta > 0 {
                 // Catch-up regeneration of audio a host already has:
@@ -705,16 +700,14 @@ impl Link {
         }
     }
 
-    /// Take up to `out`'s worth of one console's audio as interleaved
-    /// stereo, and report how much is left behind. Taking it consumes
-    /// it, which is what stops a session replaying audio it already
-    /// played after a rollback.
-    pub fn take_audio(&mut self, player: usize, out: &mut [i16]) -> (usize, usize) {
-        let buf = &mut self.audio[player];
-        let frames = (out.len() / 2).min(buf.len() / 2);
-        out[..frames * 2].copy_from_slice(&buf[..frames * 2]);
-        buf.drain(..frames * 2);
-        (frames, buf.len() / 2)
+    /// One console's per-side surface — the same view a [`Solo`] hands
+    /// out, so a frontend reads a linked console and a lone one through
+    /// one type.
+    pub fn side(&mut self, player: usize) -> Side<'_> {
+        Side {
+            console: &mut self.consoles[player],
+            audio: &mut self.audio[player],
+        }
     }
 
     /// Frames appended and kept per console so far — what a snapshot
@@ -855,6 +848,104 @@ impl Link {
             [st.seats[0].incoming.len(), st.seats[0].replies.len()],
             [st.seats[1].incoming.len(), st.seats[1].replies.len()],
         ]
+    }
+}
+
+/// One console of a boot, with the audio already taken out of its SPU:
+/// the per-console surface a frontend reads. [`Link::side`] and
+/// [`Solo::side`] hand out the same one, so nothing above here cares
+/// whether the console it is reading has a pair.
+pub struct Side<'a> {
+    console: &'a mut Nds,
+    audio: &'a mut Vec<i16>,
+}
+
+impl Side<'_> {
+    /// The console itself: video, savedata, traps.
+    pub fn console(&mut self) -> &mut Nds {
+        self.console
+    }
+
+    /// Take up to `out`'s worth of this console's audio as interleaved
+    /// stereo, and report how much is left behind. Taking it consumes
+    /// it — in a link, what stays queued stays revocable.
+    pub fn take_audio(&mut self, out: &mut [i16]) -> (usize, usize) {
+        let frames = (out.len() / 2).min(self.audio.len() / 2);
+        out[..frames * 2].copy_from_slice(&self.audio[..frames * 2]);
+        self.audio.drain(..frames * 2);
+        (frames, self.audio.len() / 2)
+    }
+}
+
+/// Empty one console's SPU into `audio`. `scratch` is the landing
+/// buffer for the read, kept by the caller so the resize amortizes.
+fn pump_spu(console: &mut Nds, audio: &mut Vec<i16>, scratch: &mut Vec<i16>) {
+    let queued = console.audio_queued();
+    if queued > 0 {
+        scratch.resize(queued * 2, 0);
+        let got = console.read_audio(scratch);
+        audio.extend_from_slice(&scratch[..got * 2]);
+    }
+}
+
+/// One console running on its own: the boot a [`Link`] gives each of
+/// its seats, with no pair, no air and no rollback.
+///
+/// What it keeps from the link is the SPU discipline: audio comes out
+/// of the SPU every tick and pools here, because the SPU's own ring is
+/// ~43 ms — a fast-forwarding host produces far more than that between
+/// two reads of its sound callback, and the ring destroys its oldest
+/// audio when it overflows.
+pub struct Solo {
+    console: Nds,
+    /// This console's audio, pooled per tick. Bounded by
+    /// [`AUDIO_CAP_FRAMES`]: nothing revokes here, so the cap alone
+    /// keeps a host that stops draining from growing it without bound.
+    audio: Vec<i16>,
+    audio_scratch: Vec<i16>,
+}
+
+impl Solo {
+    /// Boot one console. `rtc` pins the cart clock exactly as a link's
+    /// boot does — a solo ride just has nobody to agree with.
+    pub fn new(rom: &[u8], save: Option<&[u8]>, rtc: (i32, i32, i32, i32, i32, i32)) -> Result<Self, melonds::Error> {
+        let _ = melonds::install_host(Box::new(Router));
+        // A serial of its own, so this console's wireless — should the
+        // game ever touch it — talks into the void rather than into
+        // whatever pair is currently live. Never registered as CURRENT:
+        // a solo boot must not cut a live pair off the air.
+        let serial = LINK_SERIAL.fetch_add(1, Ordering::Relaxed);
+        let mut console = Nds::new(rom, save, 0, serial << 1)?;
+        console.set_rtc(rtc.0, rtc.1, rtc.2, rtc.3, rtc.4, rtc.5);
+        console.boot();
+        Ok(Solo {
+            console,
+            audio: Vec::new(),
+            audio_scratch: Vec::new(),
+        })
+    }
+
+    /// Advance one video frame.
+    pub fn tick(&mut self, input: Input) {
+        match input.touch {
+            Some((x, y)) => self.console.touch(x, y),
+            None => self.console.release_screen(),
+        }
+        self.console.set_keys(input.keys);
+        self.console.run_frame();
+        pump_spu(&mut self.console, &mut self.audio, &mut self.audio_scratch);
+        let over = self.audio.len().saturating_sub(AUDIO_CAP_FRAMES * 2);
+        if over > 0 {
+            self.audio.drain(..over);
+        }
+    }
+
+    /// The console's per-side surface, as a link hands out per seat.
+    pub fn side(&mut self) -> Side<'_> {
+        Side {
+            console: &mut self.console,
+            audio: &mut self.audio,
+        }
     }
 }
 
