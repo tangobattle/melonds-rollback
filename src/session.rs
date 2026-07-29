@@ -63,6 +63,11 @@ struct Shared {
 struct SnapshotAt {
     snap: Snapshot,
     tick: u32,
+    /// The link's audio mark at save time, so a rollback to this
+    /// snapshot knows exactly how much its speculation appended — the
+    /// amount `load` has to take back. Audio is not machine state and a
+    /// savestate does not carry it, so it is tracked alongside.
+    audio_produced: [u64; 2],
 }
 
 /// Cross-thread readout handle to a running session's link — for a
@@ -121,9 +126,11 @@ impl getgud::World for LinkWorld {
         let recycled = self.pool.pop();
         let mut shared = self.shared.lock().unwrap();
         let tick = shared.live_tick;
+        let audio_produced = shared.link.audio_produced();
         Ok(SnapshotAt {
             snap: shared.link.snapshot_into(recycled)?,
             tick,
+            audio_produced,
         })
     }
 
@@ -147,6 +154,10 @@ impl getgud::World for LinkWorld {
             return Ok(());
         }
         shared.link.restore(&state.snap)?;
+        // Audio is playback state, not machine state: the restore does
+        // not touch it, so the speculation it voices has to be taken
+        // back by hand.
+        shared.link.revoke_audio_to(state.audio_produced);
         shared.live_tick = state.tick;
         Ok(())
     }
@@ -174,6 +185,7 @@ impl Session {
         let initial_state = SnapshotAt {
             snap: link.snapshot()?,
             tick: 0,
+            audio_produced: link.audio_produced(),
         };
         let shared = Arc::new(Mutex::new(Shared {
             link,

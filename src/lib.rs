@@ -504,10 +504,46 @@ impl Snapshot {
 }
 
 /// Two DSes wired together over emulated local wireless.
+/// Frames of one console's audio the link will hold before it starts
+/// dropping the oldest — a second at the SPU's output rate.
+///
+/// Only reached by a console nobody listens to (the remote seat), which
+/// produces audio all the same and has nobody draining it. The listened
+/// console never comes near: a host keeps it at tens of ms.
+const AUDIO_CAP_FRAMES: usize = 48_000;
+
 pub struct Link {
     consoles: [Nds; 2],
     air: Arc<Air>,
     serial: usize,
+    /// Each console's audio, taken out of its SPU every tick and held
+    /// here instead.
+    ///
+    /// Held here because it has to be revocable. melonDS's SPU ring is
+    /// not: a savestate does not cover it (`SPU::DoSavestate` saves the
+    /// channels, not the output buffer), so a restore leaves speculated
+    /// audio sitting in it, and re-simulation then appends the same span
+    /// again. Nothing in the SPU's API can take it back out — and the
+    /// ring is ~43 ms, so the duplicates overflow it within a couple of
+    /// frames, at which point it starts advancing its own read cursor
+    /// and destroying the oldest audio. That is the crackle.
+    ///
+    /// Taking it out every tick fixes both halves: the SPU never
+    /// accumulates enough to overflow, and what a rollback speculated is
+    /// somewhere it can be removed from.
+    audio: [Vec<i16>; 2],
+    /// Per console, cumulative frames appended here and *kept* — net of
+    /// revocation and of re-simulation swallowed on catch-up. The
+    /// coordinate system the revocation math runs in.
+    audio_produced: [u64; 2],
+    /// Per console, frames of re-simulated audio still to swallow: the
+    /// corrected regeneration of a span whose speculative version was
+    /// already handed to a host. That cannot be unplayed, so queuing the
+    /// regeneration would be an echo. Swallowed out of the catch-up's
+    /// own fresh production instead, oldest first.
+    audio_resim_drain: [u64; 2],
+    /// Landing buffer for the per-tick take.
+    audio_scratch: Vec<i16>,
 }
 
 impl Link {
@@ -538,7 +574,15 @@ impl Link {
 
         let air = Arc::new(Air::default());
         *CURRENT.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some((serial, air.clone()));
-        Ok(Link { consoles, air, serial })
+        Ok(Link {
+            consoles,
+            air,
+            serial,
+            audio: [Vec::new(), Vec::new()],
+            audio_produced: [0; 2],
+            audio_resim_drain: [0; 2],
+            audio_scratch: Vec::new(),
+        })
     }
 
     /// Advance both consoles one video frame. The consoles run
@@ -566,6 +610,78 @@ impl Link {
                 });
             }
         });
+        self.collect_audio();
+    }
+
+    /// Take this tick's audio out of both SPUs, swallowing whatever a
+    /// rollback already owes.
+    fn collect_audio(&mut self) {
+        for i in 0..2 {
+            let before = self.audio[i].len();
+            let queued = self.consoles[i].audio_queued();
+            if queued > 0 {
+                self.audio_scratch.resize(queued * 2, 0);
+                let got = self.consoles[i].read_audio(&mut self.audio_scratch);
+                self.audio[i].extend_from_slice(&self.audio_scratch[..got * 2]);
+            }
+            let mut delta = ((self.audio[i].len() - before) / 2) as u64;
+            if self.audio_resim_drain[i] > 0 && delta > 0 {
+                // Catch-up regeneration of audio a host already has:
+                // drop it from the head of this tick's fresh span, so
+                // the seam lands exactly where playback left off.
+                let swallow = self.audio_resim_drain[i].min(delta) as usize;
+                self.audio[i].drain(before..before + swallow * 2);
+                self.audio_resim_drain[i] -= swallow as u64;
+                delta -= swallow as u64;
+            }
+            self.audio_produced[i] += delta;
+            // Nobody is draining the remote seat's, so bound it.
+            let over = self.audio[i].len().saturating_sub(AUDIO_CAP_FRAMES * 2);
+            if over > 0 {
+                self.audio[i].drain(..over);
+            }
+        }
+    }
+
+    /// Take up to `out`'s worth of one console's audio as interleaved
+    /// stereo, and report how much is left behind. Taking it consumes
+    /// it, which is what stops a session replaying audio it already
+    /// played after a rollback.
+    pub fn take_audio(&mut self, player: usize, out: &mut [i16]) -> (usize, usize) {
+        let buf = &mut self.audio[player];
+        let frames = (out.len() / 2).min(buf.len() / 2);
+        out[..frames * 2].copy_from_slice(&buf[..frames * 2]);
+        buf.drain(..frames * 2);
+        (frames, buf.len() / 2)
+    }
+
+    /// Frames appended and kept per console so far — what a snapshot
+    /// records so [`revoke_audio_to`](Self::revoke_audio_to) can tell
+    /// how much was speculated past it.
+    pub fn audio_produced(&self) -> [u64; 2] {
+        self.audio_produced
+    }
+
+    /// Take back everything appended since a snapshot recorded
+    /// `produced`.
+    ///
+    /// The part still held here is dropped from the write end — the
+    /// settled audio beneath it is final, and a blanket clear would skip
+    /// over it. The part a host already took cannot be unplayed, so its
+    /// corrected regeneration is swallowed during the catch-up instead
+    /// of queuing as an echo. By determinism the catch-up regenerates
+    /// the revoked span sample for sample, so playback resumes exactly
+    /// where it left off.
+    pub fn revoke_audio_to(&mut self, produced: [u64; 2]) {
+        for i in 0..2 {
+            let revoked = self.audio_produced[i].saturating_sub(produced[i]);
+            let held = (self.audio[i].len() / 2) as u64;
+            let dropped = revoked.min(held);
+            let keep = self.audio[i].len() - dropped as usize * 2;
+            self.audio[i].truncate(keep);
+            self.audio_resim_drain[i] = revoked - dropped;
+            self.audio_produced[i] = produced[i];
+        }
     }
 
     /// Toggle framebuffer production per console. A console nobody
