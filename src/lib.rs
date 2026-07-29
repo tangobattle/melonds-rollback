@@ -265,25 +265,28 @@ impl Air {
 }
 
 /// The process-global platform hook. melonDS resolves its callbacks at
-/// link time, so there is exactly one; it routes to whichever [`Link`]
-/// is currently live.
+/// link time, so there is exactly one; it routes each console to its
+/// own link's air.
 ///
-/// Links can overlap in time — a new match's link is created while an
-/// old session's still winds down — so routing must be precise, not
-/// "whatever exists": each link takes a serial, its consoles carry
-/// `(serial << 1) | seat` as their callback token, and only tokens of
-/// the current serial route. A stale link's consoles talk into the
-/// void instead of into the new link's air, and its drop leaves the
-/// new link's routing alone.
+/// Several links can be live at once — a replay boots a display pair
+/// and a stats pair side by side, and a new match's link is created
+/// while an old session's still winds down — so routing must be
+/// precise, not "whatever exists": each link takes a serial, its
+/// consoles carry `(serial << 1) | seat` as their callback token, and
+/// a token routes to the air registered under its serial. Each pair
+/// has its own air, so links never hear each other; a dropped link's
+/// consoles talk into the void, and its drop leaves every other
+/// link's routing alone.
 static LINK_SERIAL: AtomicUsize = AtomicUsize::new(0);
-static CURRENT: OnceLock<Mutex<Option<(usize, Arc<Air>)>>> = OnceLock::new();
+static LINKS: OnceLock<Mutex<Vec<(usize, Arc<Air>)>>> = OnceLock::new();
 
 fn route(inst: InstanceId) -> Option<(Arc<Air>, usize)> {
-    let guard = CURRENT.get()?.lock().unwrap();
-    match &*guard {
-        Some((serial, air)) if *serial == inst.0 >> 1 => Some((air.clone(), inst.0 & 1)),
-        _ => None,
-    }
+    let guard = LINKS.get()?.lock().unwrap();
+    let serial = inst.0 >> 1;
+    guard
+        .iter()
+        .find(|(s, _)| *s == serial)
+        .map(|(_, air)| (air.clone(), inst.0 & 1))
 }
 
 struct Router;
@@ -614,8 +617,9 @@ impl Link {
     /// values on every peer so the link stays a pure function of its
     /// inputs.
     ///
-    /// Only one link may exist at a time: melonDS's platform callbacks
-    /// are process-global.
+    /// Links coexist freely: each pair is on its own air, so a replay's
+    /// display and stats pairs (or a lingering old session) never hear
+    /// each other.
     pub fn new(rom: &[u8], saves: [Option<&[u8]>; 2], rtc: (i32, i32, i32, i32, i32, i32)) -> Result<Self, melonds::Error> {
         // The router is installed once and forwards to whichever link is
         // live; a second install is the expected no-op on re-entry.
@@ -635,7 +639,11 @@ impl Link {
         }
 
         let air = Arc::new(Air::default());
-        *CURRENT.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some((serial, air.clone()));
+        LINKS
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap()
+            .push((serial, air.clone()));
         Ok(Link {
             consoles,
             air,
@@ -912,7 +920,7 @@ impl Solo {
         let _ = melonds::install_host(Box::new(Router));
         // A serial of its own, so this console's wireless — should the
         // game ever touch it — talks into the void rather than into
-        // whatever pair is currently live. Never registered as CURRENT:
+        // whatever pair is currently live. Never registered in LINKS:
         // a solo boot must not cut a live pair off the air.
         let serial = LINK_SERIAL.fetch_add(1, Ordering::Relaxed);
         let mut console = Nds::new(rom, save, 0, serial << 1)?;
@@ -951,16 +959,10 @@ impl Solo {
 
 impl Drop for Link {
     fn drop(&mut self) {
-        // Only unhook if the routing still points at THIS link: a
-        // newer link may have taken over, and clearing its routing
-        // would cut its consoles off the air mid-flight — which is
-        // exactly what a stale session dropping after a new match
-        // boots used to do.
-        if let Some(slot) = CURRENT.get() {
-            let mut guard = slot.lock().unwrap();
-            if matches!(&*guard, Some((serial, _)) if *serial == self.serial) {
-                *guard = None;
-            }
+        // Unregister exactly this link's routing entry; every other
+        // live link keeps its air.
+        if let Some(links) = LINKS.get() {
+            links.lock().unwrap().retain(|(serial, _)| *serial != self.serial);
         }
     }
 }
