@@ -465,6 +465,14 @@ impl melonds::Host for SeatHost {
             let mut st = self.air.gate(me, target, true);
             loop {
                 Air::prune(&mut st.seats[me]);
+                // Too old to be an answer to this poll: never heard.
+                while st.seats[me]
+                    .replies
+                    .front()
+                    .is_some_and(|f| f.timestamp() + REPLY_STALE_US < ts)
+                {
+                    st.seats[me].replies.pop_front();
+                }
                 if !Air::due(&st.seats[me], true, target) {
                     break;
                 }
@@ -513,6 +521,25 @@ impl melonds::Host for SeatHost {
 /// applying it here would discard most of every round.
 const REPLY_WINDOW_US: u64 = 2000;
 
+/// How far *before* a poll a reply may be stamped and still be an
+/// answer to it.
+///
+/// The window had an upper edge and no lower one, so a reply that
+/// missed its own poll was not lost — it stayed at the head of the
+/// queue and was handed to a later poll as that poll's answer. A host
+/// takes exactly one reply per poll, so each miss deepened the backlog
+/// for good, and the pair spent the rest of the match reading each
+/// other that many frames stale. A radio does not do that: a reply
+/// outside its window is never heard, and the host retries.
+///
+/// A video frame, not the microseconds LocalMP used — two consoles'
+/// wifi clocks sit up to a frame apart and that horizon discarded most
+/// of every round. Worth having only once the clocks cannot drift
+/// (see `NDS::SliceEnd`): while they did, the leading console's replies
+/// were stamped in the *future* of the trailing one's polls, and the
+/// stale backlog was the only thing feeding the host at all.
+const REPLY_STALE_US: u64 = 16716;
+
 /// A point-in-time capture of an entire link: both consoles and the
 /// frames still in flight between them.
 #[derive(Clone)]
@@ -551,6 +578,11 @@ impl Snapshot {
             [self.incoming[0].len(), self.replies[0].len()],
             [self.incoming[1].len(), self.replies[1].len()],
         ]
+    }
+
+    /// SCRATCH: the two seats' published wifi clocks, in frames.
+    pub fn clocks(&self) -> [f64; 2] {
+        [0, 1].map(|i| self.progress[i] as f64 / 16716.0)
     }
 
     /// Serialize to bytes, so a primed link can be cached on disk
