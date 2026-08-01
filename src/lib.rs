@@ -30,6 +30,8 @@
 
 pub mod session;
 
+mod pool;
+
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
@@ -668,6 +670,8 @@ pub struct Link {
     audio_resim_drain: [u64; 2],
     /// Landing buffer for the per-tick take.
     audio_scratch: Vec<i16>,
+    /// The two threads the consoles run on. See [`pool`].
+    pool: pool::Pool,
 }
 
 impl Link {
@@ -699,6 +703,7 @@ impl Link {
             audio_produced: [0; 2],
             audio_resim_drain: [0; 2],
             audio_scratch: Vec::new(),
+            pool: pool::Pool::new(),
         })
     }
 
@@ -714,22 +719,20 @@ impl Link {
             // tick — settled here, at the barrier, where nothing runs.
             st.tick_attached = [st.seats[0].attached, st.seats[1].attached];
         }
-        let air = &self.air;
-        std::thread::scope(|s| {
-            for (i, nds) in self.consoles.iter_mut().enumerate() {
-                s.spawn(move || {
-                    match inputs[i].touch {
-                        Some((x, y)) => nds.touch(x, y),
-                        None => nds.release_screen(),
-                    }
-                    nds.set_keys(inputs[i].keys);
-                    nds.run_frame();
-                    let mut st = air.state.lock().unwrap();
-                    st.seats[i].frame_done = true;
-                    air.cv.notify_all();
-                });
+        let Link { consoles, air, pool, .. } = self;
+        let [nds0, nds1] = consoles;
+        let run_seat = |i: usize, nds: &mut Nds| {
+            match inputs[i].touch {
+                Some((x, y)) => nds.touch(x, y),
+                None => nds.release_screen(),
             }
-        });
+            nds.set_keys(inputs[i].keys);
+            nds.run_frame();
+            let mut st = air.state.lock().unwrap();
+            st.seats[i].frame_done = true;
+            air.cv.notify_all();
+        };
+        pool.run([Box::new(|| run_seat(0, nds0)), Box::new(|| run_seat(1, nds1))]);
         self.collect_audio();
     }
 
@@ -826,16 +829,15 @@ impl Link {
         // one after the other. Nothing is shared: each call touches only
         // its own instance and its own buffer.
         let mut results = [None, None];
-        std::thread::scope(|s| {
-            for ((nds, buf), slot) in self
-                .consoles
-                .iter_mut()
-                .zip(consoles.iter_mut())
-                .zip(results.iter_mut())
-            {
-                s.spawn(move || *slot = Some(nds.save_state(buf)));
-            }
-        });
+        {
+            let [r0, r1] = &mut results;
+            let [c0, c1] = &mut consoles;
+            let [n0, n1] = &mut self.consoles;
+            self.pool.run([
+                Box::new(move || *r0 = Some(n0.save_state(c0))),
+                Box::new(move || *r1 = Some(n1.save_state(c1))),
+            ]);
+        }
         for result in results {
             result.expect("snapshot thread did not run")?;
         }
@@ -860,16 +862,15 @@ impl Link {
     /// the one that had completed when the snapshot was taken.
     pub fn restore(&mut self, snap: &Snapshot) -> Result<(), melonds::Error> {
         let mut results = [None, None];
-        std::thread::scope(|s| {
-            for ((nds, buf), slot) in self
-                .consoles
-                .iter_mut()
-                .zip(snap.consoles.iter())
-                .zip(results.iter_mut())
-            {
-                s.spawn(move || *slot = Some(nds.load_state(buf)));
-            }
-        });
+        {
+            let [r0, r1] = &mut results;
+            let [s0, s1] = &snap.consoles;
+            let [n0, n1] = &mut self.consoles;
+            self.pool.run([
+                Box::new(move || *r0 = Some(n0.load_state(s0))),
+                Box::new(move || *r1 = Some(n1.load_state(s1))),
+            ]);
+        }
         for result in results {
             result.expect("restore thread did not run")?;
         }
