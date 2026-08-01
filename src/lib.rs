@@ -209,9 +209,27 @@ impl Air {
     /// more can arrive" about frames still to come.
     fn publish(&self, me: usize, through: u64) {
         let mut st = self.state.lock().unwrap();
-        if through != st.seats[me].progress {
-            st.seats[me].progress = through;
-            self.cv.notify_all();
+        if through == st.seats[me].progress {
+            return;
+        }
+        st.seats[me].progress = through;
+
+        // Wake the peer only if this is the publish it was waiting for.
+        //
+        // A console publishes its clock at the end of every emulated
+        // wifi batch — 380 times a video frame, measured — and the only
+        // arm of a peer's gate a publish can turn true is the one that
+        // asks whether this seat's bound has passed the peer's target.
+        // Waking it for the rest costs a wake and a re-check that fails,
+        // and it took a gate that blocked 50 times a tick down to 20.
+        // Wall time barely moved: the pair turns out to be CPU-bound,
+        // not waiting on itself. Kept because a wake nobody can use is
+        // still work nobody asked for.
+        let peer = 1 - me;
+        if let Some((target, _)) = st.seats[peer].waiting {
+            if Self::bound(&st.seats[me]) > target {
+                self.cv.notify_all();
+            }
         }
     }
 
