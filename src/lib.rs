@@ -44,17 +44,27 @@ pub struct Input {
     pub keys: u32,
     /// Stylus position, or `None` for a lifted stylus.
     pub touch: Option<(u16, u16)>,
+    /// Hold white noise on the microphone this frame (see
+    /// [`Nds::set_mic_static`]). There is no host mic here, so this is
+    /// the whole of the console's mic input — and being an input, it is
+    /// re-supplied on every re-run of the frame like the keys are.
+    pub mic: bool,
 }
 
 impl Input {
     pub fn keys(keys: u32) -> Self {
-        Input { keys, touch: None }
+        Input {
+            keys,
+            touch: None,
+            mic: false,
+        }
     }
 
     pub fn touch(x: u16, y: u16) -> Self {
         Input {
             keys: 0,
             touch: Some((x, y)),
+            mic: false,
         }
     }
 }
@@ -777,6 +787,7 @@ impl Link {
                 None => nds.release_screen(),
             }
             nds.set_keys(inputs[i].keys);
+            nds.set_mic_static(inputs[i].mic);
             nds.run_frame();
             let mut st = air.state.lock().unwrap();
             st.seats[i].frame_done = true;
@@ -1045,6 +1056,7 @@ impl Solo {
             None => self.console.release_screen(),
         }
         self.console.set_keys(input.keys);
+        self.console.set_mic_static(input.mic);
         self.console.run_frame();
         pump_spu(&mut self.console, &mut self.audio, &mut self.audio_scratch);
         let over = self.audio.len().saturating_sub(AUDIO_CAP_FRAMES * 2);
