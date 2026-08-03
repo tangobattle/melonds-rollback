@@ -127,6 +127,10 @@ struct Seat {
     frame_done: bool,
     /// Between `MP_Begin` and `MP_End` — i.e. on the air at all.
     attached: bool,
+    /// How long after [`Seat::last_cmd_ts`] that command's reply window
+    /// runs, in microseconds — see [`reply_window`], which reads it out
+    /// of the command itself.
+    last_cmd_window: u64,
     /// The stamp on the MP command this seat most recently transmitted.
     ///
     /// A reply is an answer to the poll its command opened, and to no
@@ -188,6 +192,7 @@ impl Default for Seat {
             waiting: None,
             frame_done: false,
             last_cmd_ts: 0,
+            last_cmd_window: 0,
             attached: false,
             // A radio that has never been on hears nothing.
             attached_at: u64::MAX,
@@ -446,7 +451,12 @@ impl melonds::Host for SeatHost {
         // This stamp is the lower edge of the poll this command opens
         // (see the reply-staleness rule above). Recorded before the frame
         // goes out, so the poll that follows cannot race it.
-        self.air.state.lock().unwrap().seats[self.seat].last_cmd_ts = ts;
+        {
+            let mut st = self.air.state.lock().unwrap();
+            let seat = &mut st.seats[self.seat];
+            seat.last_cmd_ts = ts;
+            seat.last_cmd_window = reply_window(data);
+        }
         self.air.send(self.seat, Frame::Other { ts, data: data.to_vec() });
         data.len() as i32
     }
@@ -516,7 +526,7 @@ impl melonds::Host for SeatHost {
     fn mp_recv_replies(&self, data: &mut [u8], now: u64, ts: u64, aidmask: u16) -> u16 {
         let me = self.seat;
         self.air.publish(me, now.saturating_sub(1));
-        let target = ts + REPLY_WINDOW_US;
+        let target = ts + self.air.state.lock().unwrap().seats[me].last_cmd_window;
         let mut mask = 0u16;
         loop {
             let mut st = self.air.gate(me, target, true);
@@ -568,13 +578,41 @@ impl melonds::Host for SeatHost {
     }
 }
 
-/// How far past a command round's timestamp a host waits for replies.
+/// The reply window an MP command opens, in microseconds past the end
+/// of the command frame — how long the host's radio listens before the
+/// round is over.
 ///
-/// LocalMP also drops replies older than the command by 32 µs. That
-/// horizon assumes both consoles run concurrently in wall-clock time;
-/// a frame-locked pair's wifi clocks sit up to a video frame apart, so
-/// applying it here would discard most of every round.
-const REPLY_WINDOW_US: u64 = 2000;
+/// A command carries the per-client reply time it grants and the mask of
+/// clients it is polling, at fixed offsets in its body. melonDS's wifi
+/// reads exactly those two fields off a received command to work out how
+/// far a client may run before it has to be back (`Wifi::RXCallback`,
+/// the `MPCmdMAC` arm) with this same arithmetic, so reading them here
+/// makes the window the protocol's own rather than a number picked to be
+/// comfortably large.
+///
+/// Upstream LocalMP has nothing to copy: it waits on a wall-clock
+/// semaphore timeout, which a frame-locked pair cannot use without
+/// letting host timing into the simulation. What this replaces was
+/// 2000 µs flat. On BN5DS the real figure is 480 — a 358 µs reply time,
+/// one client — and every value from 480 to 5000 produces the identical
+/// match on the recordings to hand, because the window is not what ends
+/// a round; the gate's own exits are. Deriving it anyway is worth the
+/// trouble because a horizon nobody could derive is exactly how the
+/// *lower* edge of this same window went wrong (see
+/// [`Seat::last_cmd_ts`]).
+fn reply_window(cmd: &[u8]) -> u64 {
+    // A 12-byte TX header, then the frame: reply time at +24, client
+    // mask at +26, which is where the sender wrote it.
+    const BODY: usize = 12;
+    let Some(fields) = cmd.get(BODY + 24..BODY + 28) else {
+        return 0;
+    };
+    let reply_time = u16::from_le_bytes([fields[0], fields[1]]) as u64;
+    let mask = u16::from_le_bytes([fields[2], fields[3]]);
+    // AID 0 is the host itself; the clients are bits 1 and up.
+    let clients = (mask & !1).count_ones() as u64;
+    112 + (reply_time + 10) * clients
+}
 
 /// A point-in-time capture of an entire link: both consoles and the
 /// frames still in flight between them.
@@ -587,6 +625,7 @@ pub struct Snapshot {
     attached: [bool; 2],
     attached_at: [u64; 2],
     last_cmd_ts: [u64; 2],
+    last_cmd_window: [u64; 2],
 }
 
 impl Snapshot {
@@ -650,6 +689,7 @@ impl Snapshot {
             out.push(self.attached[i] as u8);
             put_u64(&mut out, self.attached_at[i]);
             put_u64(&mut out, self.last_cmd_ts[i]);
+            put_u64(&mut out, self.last_cmd_window[i]);
         }
         // The token-scheduler era serialized whose turn it was here;
         // the byte stays so cached links keep parsing.
@@ -673,6 +713,7 @@ impl Snapshot {
         let mut attached = [false; 2];
         let mut attached_at = [0u64; 2];
         let mut last_cmd_ts = [0u64; 2];
+        let mut last_cmd_window = [0u64; 2];
         for i in 0..2 {
             let len = u64_at(&mut at)? as usize;
             consoles[i] = bytes.get(at..at + len)?.to_vec();
@@ -706,6 +747,7 @@ impl Snapshot {
             at += 1;
             attached_at[i] = u64_at(&mut at)?;
             last_cmd_ts[i] = u64_at(&mut at)?;
+            last_cmd_window[i] = u64_at(&mut at)?;
         }
         // Skip the legacy turn byte.
         let _ = *bytes.get(at)?;
@@ -717,6 +759,7 @@ impl Snapshot {
             attached,
             attached_at,
             last_cmd_ts,
+            last_cmd_window,
         })
     }
 }
@@ -948,6 +991,7 @@ impl Link {
             attached: [st.seats[0].attached, st.seats[1].attached],
             attached_at: [st.seats[0].attached_at, st.seats[1].attached_at],
             last_cmd_ts: [st.seats[0].last_cmd_ts, st.seats[1].last_cmd_ts],
+            last_cmd_window: [st.seats[0].last_cmd_window, st.seats[1].last_cmd_window],
         })
     }
 
@@ -975,6 +1019,7 @@ impl Link {
             st.seats[i].attached = snap.attached[i];
             st.seats[i].attached_at = snap.attached_at[i];
             st.seats[i].last_cmd_ts = snap.last_cmd_ts[i];
+            st.seats[i].last_cmd_window = snap.last_cmd_window[i];
             st.seats[i].waiting = None;
             st.seats[i].frame_done = false;
         }
