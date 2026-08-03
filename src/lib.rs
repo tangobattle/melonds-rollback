@@ -127,6 +127,48 @@ struct Seat {
     frame_done: bool,
     /// Between `MP_Begin` and `MP_End` — i.e. on the air at all.
     attached: bool,
+    /// The stamp on the MP command this seat most recently transmitted.
+    ///
+    /// A reply is an answer to the poll its command opened, and to no
+    /// other, so this is that poll's lower edge — there is no constant.
+    /// Zero until this seat has sent a command.
+    ///
+    /// The window used to have an upper edge and no lower one, so a
+    /// reply that missed its own poll was not lost: it stayed at the
+    /// head of the queue and was handed to a later poll as that poll's
+    /// answer. A host takes exactly one reply per poll, so each miss
+    /// deepened the backlog for good, and the pair spent the rest of the
+    /// match reading each other that many frames stale. A radio does not
+    /// do that — a reply outside its window is never heard, and the host
+    /// retries.
+    ///
+    /// The lower edge was then a fixed horizon, a whole video frame, on
+    /// the theory that it had to absorb the offset between the two
+    /// consoles' wifi clocks. There is no such offset to absorb. A poll
+    /// is stamped when its command finishes transmitting (melonDS calls
+    /// `MP_RecvReplies` from the CMD slot's transmit-done) while the
+    /// command frame went out stamped at transmit *start*
+    /// (`MP_SendCmd`), and a client answers off the stamp it received.
+    /// The gap between the two is the command's own airtime — on BN5DS
+    /// the 1-2 ms the fixed horizon was being sized to cover, and the
+    /// reason it looked like a clock offset.
+    ///
+    /// So the edge is not a quantity to pick. A frame-wide horizon was
+    /// ~29x the airtime it stood in for, wide enough to swallow a whole
+    /// MP round (that cart runs about two per video frame), and that is
+    /// what made the following reachable. When a round is abandoned
+    /// because the peer ended its video frame before it could answer
+    /// (see [`Air::gate`]), the reply it sends on the next tick still
+    /// fell inside the *next* poll's horizon. The host took the previous
+    /// round's reply as this round's answer, the pair stayed mispaired by
+    /// one round for good, and BN5DS's link battle never assembled
+    /// another MP data set: its WM read answered NO_DATASET every frame
+    /// from then on and the battle stopped stepping, with the wireless
+    /// still associated and still carrying frames. It cost a recorded
+    /// match its second round, 226 seconds in, and reproduced at the
+    /// identical tick with every input blanked — a match nobody played
+    /// wedges in the same place, because nothing about it is the game's.
+    last_cmd_ts: u64,
     /// When this radio's current attach epoch began, in its own wifi
     /// clock — `u64::MAX` while it is off the air. Frames stamped
     /// before this instant were transmitted before the radio came up,
@@ -145,6 +187,7 @@ impl Default for Seat {
             progress: 0,
             waiting: None,
             frame_done: false,
+            last_cmd_ts: 0,
             attached: false,
             // A radio that has never been on hears nothing.
             attached_at: u64::MAX,
@@ -400,6 +443,10 @@ impl melonds::Host for SeatHost {
     }
 
     fn mp_send_cmd(&self, data: &[u8], ts: u64) -> i32 {
+        // This stamp is the lower edge of the poll this command opens
+        // (see the reply-staleness rule above). Recorded before the frame
+        // goes out, so the poll that follows cannot race it.
+        self.air.state.lock().unwrap().seats[self.seat].last_cmd_ts = ts;
         self.air.send(self.seat, Frame::Other { ts, data: data.to_vec() });
         data.len() as i32
     }
@@ -475,12 +522,10 @@ impl melonds::Host for SeatHost {
             let mut st = self.air.gate(me, target, true);
             loop {
                 Air::prune(&mut st.seats[me]);
-                // Too old to be an answer to this poll: never heard.
-                while st.seats[me]
-                    .replies
-                    .front()
-                    .is_some_and(|f| f.timestamp() + REPLY_STALE_US < ts)
-                {
+                // Stamped before this poll's own command went out, so it
+                // answers an earlier one: never heard.
+                let cmd_ts = st.seats[me].last_cmd_ts;
+                while st.seats[me].replies.front().is_some_and(|f| f.timestamp() < cmd_ts) {
                     st.seats[me].replies.pop_front();
                 }
                 if !Air::due(&st.seats[me], true, target) {
@@ -531,25 +576,6 @@ impl melonds::Host for SeatHost {
 /// applying it here would discard most of every round.
 const REPLY_WINDOW_US: u64 = 2000;
 
-/// How far *before* a poll a reply may be stamped and still be an
-/// answer to it.
-///
-/// The window had an upper edge and no lower one, so a reply that
-/// missed its own poll was not lost — it stayed at the head of the
-/// queue and was handed to a later poll as that poll's answer. A host
-/// takes exactly one reply per poll, so each miss deepened the backlog
-/// for good, and the pair spent the rest of the match reading each
-/// other that many frames stale. A radio does not do that: a reply
-/// outside its window is never heard, and the host retries.
-///
-/// A video frame, not the microseconds LocalMP used — two consoles'
-/// wifi clocks sit up to a frame apart and that horizon discarded most
-/// of every round. Worth having only once the clocks cannot drift
-/// (see `NDS::SliceEnd`): while they did, the leading console's replies
-/// were stamped in the *future* of the trailing one's polls, and the
-/// stale backlog was the only thing feeding the host at all.
-const REPLY_STALE_US: u64 = 16716;
-
 /// A point-in-time capture of an entire link: both consoles and the
 /// frames still in flight between them.
 #[derive(Clone)]
@@ -560,6 +586,7 @@ pub struct Snapshot {
     progress: [u64; 2],
     attached: [bool; 2],
     attached_at: [u64; 2],
+    last_cmd_ts: [u64; 2],
 }
 
 impl Snapshot {
@@ -622,6 +649,7 @@ impl Snapshot {
             put_u64(&mut out, self.progress[i]);
             out.push(self.attached[i] as u8);
             put_u64(&mut out, self.attached_at[i]);
+            put_u64(&mut out, self.last_cmd_ts[i]);
         }
         // The token-scheduler era serialized whose turn it was here;
         // the byte stays so cached links keep parsing.
@@ -644,6 +672,7 @@ impl Snapshot {
         let mut progress = [0u64; 2];
         let mut attached = [false; 2];
         let mut attached_at = [0u64; 2];
+        let mut last_cmd_ts = [0u64; 2];
         for i in 0..2 {
             let len = u64_at(&mut at)? as usize;
             consoles[i] = bytes.get(at..at + len)?.to_vec();
@@ -676,6 +705,7 @@ impl Snapshot {
             attached[i] = *bytes.get(at)? != 0;
             at += 1;
             attached_at[i] = u64_at(&mut at)?;
+            last_cmd_ts[i] = u64_at(&mut at)?;
         }
         // Skip the legacy turn byte.
         let _ = *bytes.get(at)?;
@@ -686,6 +716,7 @@ impl Snapshot {
             progress,
             attached,
             attached_at,
+            last_cmd_ts,
         })
     }
 }
@@ -916,6 +947,7 @@ impl Link {
             progress: [st.seats[0].progress, st.seats[1].progress],
             attached: [st.seats[0].attached, st.seats[1].attached],
             attached_at: [st.seats[0].attached_at, st.seats[1].attached_at],
+            last_cmd_ts: [st.seats[0].last_cmd_ts, st.seats[1].last_cmd_ts],
         })
     }
 
@@ -942,6 +974,7 @@ impl Link {
             st.seats[i].progress = snap.progress[i];
             st.seats[i].attached = snap.attached[i];
             st.seats[i].attached_at = snap.attached_at[i];
+            st.seats[i].last_cmd_ts = snap.last_cmd_ts[i];
             st.seats[i].waiting = None;
             st.seats[i].frame_done = false;
         }
