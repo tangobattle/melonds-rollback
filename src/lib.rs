@@ -1085,25 +1085,44 @@ mod tests {
         Frame::Other { ts, data: vec![0; 32] }
     }
 
-    /// Wifi off is a radio that is not there to hear anything —
-    /// `attached` tracks the console's wifi power exactly (melonDS calls
-    /// `MP_Begin`/`MP_End` from `Wifi::UpdatePowerOn`).
+    /// Wifi off is a radio that is not there to hear anything — but the
+    /// send path is not where that is decided. A frame queues whatever
+    /// the peer's radio is doing, and whether the peer hears it is its
+    /// own epoch's question ([`Seat::attached_at`], applied by
+    /// [`Air::due`] and [`Air::prune`]), answered in emulated time.
     ///
-    /// Holding frames for it instead is what let a console that left its
-    /// comm screen keep collecting the other's beacons for the rest of
-    /// the match. Nothing ever popped them, and every one was cloned
-    /// into every per-tick snapshot, so the tick cost climbed until the
-    /// pair stopped producing frames.
+    /// Dropping on the live flag instead made delivery depend on whether
+    /// the peer's thread had reached its `MP_Begin` yet — wall-clock
+    /// timing deciding which association frames exist. A seat that never
+    /// attaches back is bounded by the RX depth below, not by this.
     #[test]
-    fn a_seat_whose_wifi_is_off_receives_nothing() {
+    fn a_seat_whose_wifi_is_off_hears_nothing() {
         let air = Air::default();
 
+        // Never been on the air: the frame queues all the same, and the
+        // seat's epoch is what leaves it unheard.
         air.send(0, frame(1));
-        assert_eq!(air.state.lock().unwrap().seats[1].incoming.len(), 0);
+        {
+            let st = air.state.lock().unwrap();
+            assert_eq!(st.seats[1].incoming.len(), 1);
+            assert!(!Air::due(&st.seats[1], false, u64::MAX));
+        }
 
-        air.state.lock().unwrap().seats[1].attached = true;
+        // On the air from stamp 2. The frame sent inside that epoch is
+        // heard; the one from before it never is, and prunes away.
+        {
+            let mut st = air.state.lock().unwrap();
+            st.seats[1].attached = true;
+            st.seats[1].attached_at = 2;
+        }
         air.send(0, frame(2));
-        assert_eq!(air.state.lock().unwrap().seats[1].incoming.len(), 1);
+        {
+            let mut st = air.state.lock().unwrap();
+            assert!(Air::due(&st.seats[1], false, u64::MAX));
+            Air::prune(&mut st.seats[1]);
+            assert_eq!(st.seats[1].incoming.len(), 1);
+            assert_eq!(st.seats[1].incoming.front().unwrap().timestamp(), 2);
+        }
     }
 
     /// An RX queue is finite hardware. A receiver that stops draining —
