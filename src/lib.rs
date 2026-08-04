@@ -619,6 +619,11 @@ fn reply_window(cmd: &[u8]) -> u64 {
 #[derive(Clone)]
 pub struct Snapshot {
     consoles: [Vec<u8>; 2],
+    /// What each console buffer holds, so the next capture into it —
+    /// and any restore out of it — moves only the pages that have
+    /// changed since. Defaulted for a snapshot parsed from bytes: those
+    /// buffers belong to no console, and the default tag says so.
+    gens: [melonds::StateGen; 2],
     incoming: [Vec<Frame>; 2],
     replies: [Vec<Frame>; 2],
     progress: [u64; 2],
@@ -629,6 +634,12 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// One console's serialized state, for a probe checking a capture
+    /// against another one — see `examples/snapcheck.rs`.
+    pub fn console_bytes(&self, player: usize) -> &[u8] {
+        &self.consoles[player]
+    }
+
     /// Total bytes held, for callers budgeting a rollback buffer.
     ///
     /// The air counts. Its frames are cloned into every snapshot the
@@ -752,6 +763,7 @@ impl Snapshot {
         // Skip the legacy turn byte.
         let _ = *bytes.get(at)?;
         Some(Snapshot {
+            gens: Default::default(),
             consoles,
             incoming,
             replies,
@@ -955,9 +967,9 @@ impl Link {
     /// Rollback retires a snapshot nearly every tick, so reusing those
     /// allocations keeps a session off the allocator's hot path.
     pub fn snapshot_into(&mut self, recycled: Option<Snapshot>) -> Result<Snapshot, melonds::Error> {
-        let mut consoles = match recycled {
-            Some(snap) => snap.consoles,
-            None => [Vec::new(), Vec::new()],
+        let (mut consoles, prev) = match recycled {
+            Some(snap) => (snap.consoles, snap.gens),
+            None => ([Vec::new(), Vec::new()], Default::default()),
         };
         // The two consoles serialize independently, and at ~6 MB each
         // this is memory-bound — so do them at the same time rather than
@@ -968,17 +980,20 @@ impl Link {
             let [r0, r1] = &mut results;
             let [c0, c1] = &mut consoles;
             let [n0, n1] = &mut self.consoles;
+            let [p0, p1] = prev;
             self.pool.run([
-                Box::new(move || *r0 = Some(n0.save_state(c0))),
-                Box::new(move || *r1 = Some(n1.save_state(c1))),
+                Box::new(move || *r0 = Some(n0.save_state_since(c0, p0))),
+                Box::new(move || *r1 = Some(n1.save_state_since(c1, p1))),
             ]);
         }
-        for result in results {
-            result.expect("snapshot thread did not run")?;
+        let mut gens = <[melonds::StateGen; 2]>::default();
+        for (gen, result) in gens.iter_mut().zip(results) {
+            *gen = result.expect("snapshot thread did not run")?;
         }
         let st = self.air.state.lock().unwrap();
         Ok(Snapshot {
             consoles,
+            gens,
             incoming: [
                 st.seats[0].incoming.iter().cloned().collect(),
                 st.seats[1].incoming.iter().cloned().collect(),
@@ -1002,10 +1017,11 @@ impl Link {
         {
             let [r0, r1] = &mut results;
             let [s0, s1] = &snap.consoles;
+            let [g0, g1] = snap.gens;
             let [n0, n1] = &mut self.consoles;
             self.pool.run([
-                Box::new(move || *r0 = Some(n0.load_state(s0))),
-                Box::new(move || *r1 = Some(n1.load_state(s1))),
+                Box::new(move || *r0 = Some(n0.load_state_from(s0, g0))),
+                Box::new(move || *r1 = Some(n1.load_state_from(s1, g1))),
             ]);
         }
         for result in results {
