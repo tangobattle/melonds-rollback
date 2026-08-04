@@ -13,18 +13,25 @@
 //! a tenth of a capture. These threads are made once per link and parked
 //! on a channel between jobs, so the same tick pays two wakeups instead.
 //!
-//! Nothing about the concurrency changes: the caller still blocks until
-//! both halves are done, so a job may borrow from the caller's frame
-//! exactly as a scoped one could, and the link's determinism argument
-//! (frame delivery gates on emulated time alone, never on which thread
-//! ran first) is untouched.
+//! What a scope would have permitted that a channel cannot is borrowing:
+//! a job handed to a long-lived thread must be `'static`. So jobs here
+//! do not borrow — each one owns what it works on, a console and its
+//! buffers, and hands all of it back through its result. The caller
+//! still blocks until both halves are done, and the link's determinism
+//! argument (frame delivery gates on emulated time alone, never on
+//! which thread ran first) is untouched.
 
+use std::any::Any;
 use std::panic::AssertUnwindSafe;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread::JoinHandle;
 
-type Job = Box<dyn FnOnce() + Send + 'static>;
-type Outcome = std::thread::Result<()>;
+/// What comes back over a worker's channel: the job's boxed result, or
+/// the panic that took its place. [`Pool::run`] put the real type in,
+/// so it is the one place that can take it back out.
+type Payload = Box<dyn Any + Send>;
+type Job = Box<dyn FnOnce() -> Payload + Send>;
+type Outcome = std::thread::Result<Payload>;
 
 /// A pair of parked worker threads, one per seat.
 pub(crate) struct Pool {
@@ -44,36 +51,29 @@ impl Pool {
         }
     }
 
-    /// Run both closures at once and return when both have finished.
+    /// Run both jobs at once and return their results when both have
+    /// finished.
     ///
     /// A panic in either is carried back and resumed on the caller,
     /// after the other half has been waited for — the same order
-    /// `thread::scope` reports one in.
-    pub(crate) fn run<'a>(&mut self, jobs: [Box<dyn FnOnce() + Send + 'a>; 2]) {
+    /// `thread::scope` reports one in. Whatever the panicking job
+    /// owned went down with it.
+    pub(crate) fn run<R, F>(&mut self, jobs: [F; 2]) -> [R; 2]
+    where
+        R: Send + 'static,
+        F: FnOnce() -> R + Send + 'static,
+    {
         let [a, b] = jobs;
-        // SAFETY: both sends are matched by a receive below before this
-        // function returns, so neither job outlives the borrows it
-        // captured — the invariant `thread::scope` enforces statically.
-        // A worker whose channel is closed has already died, and its
-        // `done` receive then reports that rather than blocking.
-        unsafe {
-            self.workers[0].dispatch(erase(a));
-            self.workers[1].dispatch(erase(b));
-        }
-        let first = self.workers[0].wait();
-        let second = self.workers[1].wait();
-        for outcome in [first, second] {
-            if let Err(payload) = outcome {
-                std::panic::resume_unwind(payload);
-            }
-        }
+        self.workers[0].dispatch(Box::new(move || Box::new(a()) as Payload));
+        self.workers[1].dispatch(Box::new(move || Box::new(b()) as Payload));
+        let outcomes = [self.workers[0].wait(), self.workers[1].wait()];
+        outcomes.map(|outcome| match outcome {
+            Ok(result) => *result
+                .downcast()
+                .unwrap_or_else(|_| unreachable!("a result is what its job boxed")),
+            Err(payload) => std::panic::resume_unwind(payload),
+        })
     }
-}
-
-/// Forget a job's lifetime so it can cross a channel. Sound only
-/// because [`Pool::run`] joins before it returns.
-unsafe fn erase<'a>(job: Box<dyn FnOnce() + Send + 'a>) -> Job {
-    std::mem::transmute::<Box<dyn FnOnce() + Send + 'a>, Job>(job)
 }
 
 impl Worker {

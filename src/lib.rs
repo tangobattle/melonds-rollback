@@ -618,7 +618,10 @@ fn reply_window(cmd: &[u8]) -> u64 {
 /// frames still in flight between them.
 #[derive(Clone)]
 pub struct Snapshot {
-    consoles: [Vec<u8>; 2],
+    /// Behind `Arc` so a restore can hand each buffer to its console's
+    /// thread without copying or borrowing it. Clones share; a capture
+    /// recycling a still-shared buffer allocates a fresh one instead.
+    consoles: [Arc<Vec<u8>>; 2],
     /// What each console buffer holds, so the next capture into it —
     /// and any restore out of it — moves only the pages that have
     /// changed since. Defaulted for a snapshot parsed from bytes: those
@@ -654,7 +657,7 @@ impl Snapshot {
                 .map(|f| std::mem::size_of::<Frame>() + f.payload_len())
                 .sum()
         };
-        self.consoles.iter().map(Vec::len).sum::<usize>() + frames(&self.incoming) + frames(&self.replies)
+        self.consoles.iter().map(|c| c.len()).sum::<usize>() + frames(&self.incoming) + frames(&self.replies)
     }
 
     /// Frames in flight per seat: `[incoming, replies]` for seat 0 then
@@ -764,7 +767,7 @@ impl Snapshot {
         let _ = *bytes.get(at)?;
         Some(Snapshot {
             gens: Default::default(),
-            consoles,
+            consoles: consoles.map(Arc::new),
             incoming,
             replies,
             progress,
@@ -786,7 +789,10 @@ impl Snapshot {
 const AUDIO_CAP_FRAMES: usize = 48_000;
 
 pub struct Link {
-    consoles: [Nds; 2],
+    /// Both consoles. `None` only while a [`pool`] job owns one — every
+    /// run moves the consoles out to the workers and back — or after a
+    /// job's panic dropped one on its way out.
+    consoles: [Option<Nds>; 2],
     air: Arc<Air>,
     /// Each console's audio, taken out of its SPU every tick and held
     /// here instead.
@@ -843,7 +849,7 @@ impl Link {
         }
 
         Ok(Link {
-            consoles,
+            consoles: consoles.map(Some),
             air,
             audio: [Vec::new(), Vec::new()],
             audio_produced: [0; 2],
@@ -851,6 +857,13 @@ impl Link {
             audio_scratch: Vec::new(),
             pool: pool::Pool::new(),
         })
+    }
+
+    /// Move both consoles out to hand to [`pool`] jobs; every taker
+    /// puts them back before it returns. Absence here means an earlier
+    /// job panicked and its console went down with it.
+    fn take_consoles(&mut self) -> [Nds; 2] {
+        [0, 1].map(|i| self.consoles[i].take().expect("a console went down with a link worker"))
     }
 
     /// Advance both consoles one video frame. The consoles run
@@ -865,21 +878,28 @@ impl Link {
             // tick — settled here, at the barrier, where nothing runs.
             st.tick_attached = [st.seats[0].attached, st.seats[1].attached];
         }
-        let Link { consoles, air, pool, .. } = self;
-        let [nds0, nds1] = consoles;
-        let run_seat = |i: usize, nds: &mut Nds| {
-            match inputs[i].touch {
-                Some((x, y)) => nds.touch(x, y),
-                None => nds.release_screen(),
+        let [nds0, nds1] = self.take_consoles();
+        let run_seat = |seat: usize, mut nds: Nds| {
+            let input = inputs[seat];
+            let air = self.air.clone();
+            move || {
+                match input.touch {
+                    Some((x, y)) => nds.touch(x, y),
+                    None => nds.release_screen(),
+                }
+                nds.set_keys(input.keys);
+                nds.set_mic_static(input.mic);
+                nds.run_frame();
+                {
+                    let mut st = air.state.lock().unwrap();
+                    st.seats[seat].frame_done = true;
+                    air.cv.notify_all();
+                }
+                nds
             }
-            nds.set_keys(inputs[i].keys);
-            nds.set_mic_static(inputs[i].mic);
-            nds.run_frame();
-            let mut st = air.state.lock().unwrap();
-            st.seats[i].frame_done = true;
-            air.cv.notify_all();
         };
-        pool.run([Box::new(|| run_seat(0, nds0)), Box::new(|| run_seat(1, nds1))]);
+        let [nds0, nds1] = self.pool.run([run_seat(0, nds0), run_seat(1, nds1)]);
+        self.consoles = [Some(nds0), Some(nds1)];
         self.collect_audio();
     }
 
@@ -888,7 +908,8 @@ impl Link {
     fn collect_audio(&mut self) {
         for i in 0..2 {
             let before = self.audio[i].len();
-            pump_spu(&mut self.consoles[i], &mut self.audio[i], &mut self.audio_scratch);
+            let console = self.consoles[i].as_mut().expect("a console went down with a link worker");
+            pump_spu(console, &mut self.audio[i], &mut self.audio_scratch);
             let mut delta = ((self.audio[i].len() - before) / 2) as u64;
             if self.audio_resim_drain[i] > 0 && delta > 0 {
                 // Catch-up regeneration of audio a host already has:
@@ -913,7 +934,7 @@ impl Link {
     /// one type.
     pub fn side(&mut self, player: usize) -> Side<'_> {
         Side {
-            console: &mut self.consoles[player],
+            console: self.consoles[player].as_mut().expect("a console went down with a link worker"),
             audio: &mut self.audio[player],
         }
     }
@@ -954,7 +975,7 @@ impl Link {
     /// way, only the framebuffer goes stale while off.
     pub fn set_render(&mut self, render: [bool; 2]) {
         for (nds, on) in self.consoles.iter_mut().zip(render) {
-            nds.set_render(on);
+            nds.as_mut().expect("a console went down with a link worker").set_render(on);
         }
     }
 
@@ -967,32 +988,32 @@ impl Link {
     /// Rollback retires a snapshot nearly every tick, so reusing those
     /// allocations keeps a session off the allocator's hot path.
     pub fn snapshot_into(&mut self, recycled: Option<Snapshot>) -> Result<Snapshot, melonds::Error> {
-        let (mut consoles, prev) = match recycled {
-            Some(snap) => (snap.consoles, snap.gens),
+        let (bufs, prev) = match recycled {
+            // A buffer is reusable only if this snapshot was its last
+            // holder — a clone keeps it alive, and the capture then
+            // starts fresh.
+            Some(snap) => (snap.consoles.map(|buf| Arc::try_unwrap(buf).unwrap_or_default()), snap.gens),
             None => ([Vec::new(), Vec::new()], Default::default()),
         };
         // The two consoles serialize independently, and at ~6 MB each
         // this is memory-bound — so do them at the same time rather than
-        // one after the other. Nothing is shared: each call touches only
-        // its own instance and its own buffer.
-        let mut results = [None, None];
-        {
-            let [r0, r1] = &mut results;
-            let [c0, c1] = &mut consoles;
-            let [n0, n1] = &mut self.consoles;
-            let [p0, p1] = prev;
-            self.pool.run([
-                Box::new(move || *r0 = Some(n0.save_state_since(c0, p0))),
-                Box::new(move || *r1 = Some(n1.save_state_since(c1, p1))),
-            ]);
-        }
-        let mut gens = <[melonds::StateGen; 2]>::default();
-        for (gen, result) in gens.iter_mut().zip(results) {
-            *gen = result.expect("snapshot thread did not run")?;
-        }
+        // one after the other. Nothing is shared: each job owns its own
+        // instance and its own buffer, and hands both back.
+        let save = |mut nds: Nds, mut buf: Vec<u8>, prev: melonds::StateGen| {
+            move || {
+                let gen = nds.save_state_since(&mut buf, prev);
+                (nds, buf, gen)
+            }
+        };
+        let [b0, b1] = bufs;
+        let [p0, p1] = prev;
+        let [n0, n1] = self.take_consoles();
+        let [(n0, b0, g0), (n1, b1, g1)] = self.pool.run([save(n0, b0, p0), save(n1, b1, p1)]);
+        self.consoles = [Some(n0), Some(n1)];
+        let gens = [g0?, g1?];
         let st = self.air.state.lock().unwrap();
         Ok(Snapshot {
-            consoles,
+            consoles: [Arc::new(b0), Arc::new(b1)],
             gens,
             incoming: [
                 st.seats[0].incoming.iter().cloned().collect(),
@@ -1013,20 +1034,21 @@ impl Link {
     /// Resume from a capture. Simulation continues from the frame *after*
     /// the one that had completed when the snapshot was taken.
     pub fn restore(&mut self, snap: &Snapshot) -> Result<(), melonds::Error> {
-        let mut results = [None, None];
-        {
-            let [r0, r1] = &mut results;
-            let [s0, s1] = &snap.consoles;
-            let [g0, g1] = snap.gens;
-            let [n0, n1] = &mut self.consoles;
-            self.pool.run([
-                Box::new(move || *r0 = Some(n0.load_state_from(s0, g0))),
-                Box::new(move || *r1 = Some(n1.load_state_from(s1, g1))),
-            ]);
-        }
-        for result in results {
-            result.expect("restore thread did not run")?;
-        }
+        // The buffers ride their `Arc`s out to the jobs — a restore
+        // shares the snapshot's bytes, it never copies them.
+        let load = |mut nds: Nds, buf: Arc<Vec<u8>>, gen: melonds::StateGen| {
+            move || {
+                let result = nds.load_state_from(&buf, gen);
+                (nds, result)
+            }
+        };
+        let [s0, s1] = [snap.consoles[0].clone(), snap.consoles[1].clone()];
+        let [g0, g1] = snap.gens;
+        let [n0, n1] = self.take_consoles();
+        let [(n0, r0), (n1, r1)] = self.pool.run([load(n0, s0, g0), load(n1, s1, g1)]);
+        self.consoles = [Some(n0), Some(n1)];
+        r0?;
+        r1?;
         let mut st = self.air.state.lock().unwrap();
         for i in 0..2 {
             st.seats[i].incoming = snap.incoming[i].iter().cloned().collect();
@@ -1048,7 +1070,7 @@ impl Link {
 
     /// Borrow one console, for video/audio/RAM readout.
     pub fn console(&mut self, player: usize) -> &mut Nds {
-        &mut self.consoles[player]
+        self.consoles[player].as_mut().expect("a console went down with a link worker")
     }
 
     /// Whether both consoles are currently on the air — true once a
