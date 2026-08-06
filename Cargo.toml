@@ -13,6 +13,17 @@ melonds = { git = "https://github.com/tangobattle/melonds-rs" }
 getgud = { git = "https://github.com/tangobattle/getgud" }
 thiserror = "1"
 
+# In a browser the pair's two threads are Web Workers sharing the
+# module's memory; wasm_thread is std::thread's API over that
+# choreography. See pool.rs. Needs the whole build compiled with
+# atomics and served cross-origin-isolated — the consuming app's
+# problem (tango-lite-web's build.sh), not this crate's.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm_thread = "0.3"
+# The worker bootstrap needs to know where the wasm-bindgen glue lives;
+# resolving that reads the JS stack (see pool::stock::shim_url).
+js-sys = "0.3"
+
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
 sha2 = "0.10"

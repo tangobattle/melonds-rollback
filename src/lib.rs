@@ -32,6 +32,39 @@ pub mod session;
 
 mod pool;
 
+/// Browser hosts only: spawn the pool's Web Workers ahead of the link
+/// that will use them. A fresh worker finishes starting up only once
+/// the browser's main thread has had event-loop turns — and a link
+/// advancing waits for its workers by spinning that thread. So a host
+/// calls this while it is still awaiting other things (signaling, save
+/// negotiation), and by the time the link runs, the workers are warm.
+/// `count` is consoles: 2 for one link, 4 for a session that runs two
+/// (a replay's display and prefetch pairs). Workers return to the
+/// stock when their link ends, so the count converges rather than
+/// accumulating.
+#[cfg(target_arch = "wasm32")]
+pub fn warm_workers(count: usize) {
+    pool::stock::warm(count);
+}
+
+/// Browser hosts only: whether `count` warmed workers have actually
+/// come up and parked. A host that is about to run a link from a
+/// non-yielding loop (a pumped boot tick) holds off until this says
+/// yes — worker startup finishes only while the main thread yields,
+/// and the link's waits spin it.
+#[cfg(target_arch = "wasm32")]
+pub fn workers_ready(count: usize) -> bool {
+    pool::stock::ready(count)
+}
+
+/// Browser hosts only: where the wasm-bindgen glue script lives, for
+/// the worker bootstrap. Optional — the stock resolves it off the JS
+/// stack — but a host with an unusual layout can say so explicitly.
+#[cfg(target_arch = "wasm32")]
+pub fn set_worker_shim_url(url: String) {
+    pool::stock::set_shim_url(url);
+}
+
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
