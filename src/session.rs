@@ -227,7 +227,7 @@ impl Session {
         // itself renders nothing at all: no simulated tick ever clears
         // that bar.)
         self.shared.lock().unwrap().render_from = before.saturating_sub(self.inner.present_delay());
-        let frame = self.inner.advance(local_input)?;
+        let frame = self.inner.advance(local_input)?.frame;
         let tick = frame.tick;
         Ok((
             Outgoing {
