@@ -293,7 +293,7 @@ dependencies = [
 [[package]]
 name = "getgud"
 version = "0.1.0"
-source = "git+https://github.com/tangobattle/getgud#747b51bba50589f83f6e6724fcb01ccf35d73c73"
+source = "git+https://github.com/tangobattle/getgud#aeceaae69f0f62998596649a406422e54cf61e89"
 
 [[package]]
 name = "getrandom"

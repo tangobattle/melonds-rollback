@@ -145,14 +145,10 @@ impl getgud::World for LinkWorld {
     fn load(&mut self, state: &SnapshotAt) -> Result<(), melonds::Error> {
         let mut guard = self.shared.lock().unwrap();
         let shared = &mut *guard;
-        // The engine loads the settled state before every re-simulation;
-        // when nothing speculated past it, the link is already parked
-        // there and — by determinism — holds exactly this state, so the
-        // restore is pure cost. DS snapshots are ~37 MiB, which makes
-        // skipping it worth the check.
-        if shared.live_tick == state.tick {
-            return Ok(());
-        }
+        // getgud loads only to move the link, never to the tick it is
+        // parked at (DS snapshots are ~37 MiB, so that matters), except
+        // after an error, when the link may be part-way through a tick and
+        // has to be restored wherever it is.
         shared.link.restore(&state.snap)?;
         // Audio is playback state, not machine state: the restore does
         // not touch it, so the speculation it voices has to be taken
